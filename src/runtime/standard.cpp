@@ -11,6 +11,7 @@
 #include "tasks/base/wheel_odometry.hpp"
 #include "utils/drivers/camera_factory.hpp"
 #include "utils/io/video_save.hpp"
+#include "utils/io/serial_trace.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -19,7 +20,9 @@
 #include <memory>
 #include <mutex>
 #include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #ifdef USE_RERUN
@@ -55,7 +58,6 @@
 #include "utils/drivers/command_protocol.hpp"
 #include "utils/drivers/serial_driver.hpp"
 #include "utils/drivers/telemetry_protocol.hpp"
-#include "utils/drivers/vision_command_guard.hpp"
 #include "utils/logger.hpp"
 #include "utils/runtime_tf.hpp"
 #include "utils/scheduler/scheduler.hpp"
@@ -198,33 +200,6 @@ int main(int argc, char** argv) {
     if (!use_daedalus && config["serial"]["enable"].as<bool>()) {
         serial = std::make_unique<SerialDriver>(config["serial"], s);
     }
-    VisionCommandGuard::Params command_guard_params;
-    if (const auto guard = config["serial"]["command_guard"]) {
-        command_guard_params.acquire_ms =
-            guard["acquire_ms"].as<int>(command_guard_params.acquire_ms);
-        command_guard_params.fire_settle_ms =
-            guard["fire_settle_ms"].as<int>(command_guard_params.fire_settle_ms);
-        command_guard_params.min_distance_m =
-            guard["min_distance_m"].as<double>(command_guard_params.min_distance_m);
-        command_guard_params.max_distance_m =
-            guard["max_distance_m"].as<double>(command_guard_params.max_distance_m);
-        command_guard_params.max_yaw_jump_deg =
-            guard["max_yaw_jump_deg"].as<double>(command_guard_params.max_yaw_jump_deg);
-        command_guard_params.max_pitch_jump_deg =
-            guard["max_pitch_jump_deg"].as<double>(command_guard_params.max_pitch_jump_deg);
-        command_guard_params.max_yaw_rate_deg_s =
-            guard["max_yaw_rate_deg_s"].as<double>(command_guard_params.max_yaw_rate_deg_s);
-        command_guard_params.max_pitch_rate_deg_s =
-            guard["max_pitch_rate_deg_s"].as<double>(command_guard_params.max_pitch_rate_deg_s);
-        command_guard_params.filter_time_constant_s = guard["filter_time_constant_s"].as<double>(
-            command_guard_params.filter_time_constant_s
-        );
-        command_guard_params.fire_alignment_tolerance_deg =
-            guard["fire_alignment_tolerance_deg"].as<double>(
-                command_guard_params.fire_alignment_tolerance_deg
-            );
-    }
-    VisionCommandGuard command_guard(command_guard_params);
 
     auto camera_config = config["camera"];
     std::unique_ptr<Camera> camera;
@@ -241,10 +216,32 @@ int main(int argc, char** argv) {
         }
     }
     std::unique_ptr<VideoSaver> video_saver;
+    std::shared_ptr<SerialTrace> serial_trace;
+    std::atomic<uint64_t> video_frame_index {0};
     if (config["record"]["enable"].as<bool>()) {
-        video_saver = std::make_unique<VideoSaver>(
-            VideoSaver::generate_record_filename(RECORD_FOLDER_PATH.data()),
-            VideoSaver::Mode::NonBlocking
+        const std::string video_path =
+            VideoSaver::generate_record_filename(RECORD_FOLDER_PATH.data());
+        video_saver =
+            std::make_unique<VideoSaver>(video_path, VideoSaver::Mode::NonBlocking);
+        std::string trace_path = video_path;
+        if (trace_path.size() >= 4) {
+            trace_path = trace_path.substr(0, trace_path.size() - 4) + ".csv";
+        }
+        serial_trace = std::make_shared<SerialTrace>(trace_path, video_path);
+        AWAKENING_INFO("record video={} serial_trace={}", video_path, trace_path);
+    }
+    if (serial && serial_trace) {
+        serial->set_trace_callbacks(
+            [serial_trace](
+                const TongjiTelemetry& telemetry,
+                const uint8_t* raw,
+                size_t size,
+                TelemetryStream::Clock::time_point
+            ) { serial_trace->log_rx(telemetry, raw, size); },
+            [serial_trace](
+                const std::vector<uint8_t>& command,
+                TelemetryStream::Clock::time_point
+            ) { serial_trace->log_tx(command); }
         );
     }
     CameraInfo camera_info;
@@ -381,7 +378,27 @@ int main(int argc, char** argv) {
     if (video_saver) {
         s.register_task<CameraIO>("save_video", [&](CameraIO::second_type&& f) {
             if (!f.src_img.empty()) {
-                video_saver->write_frame(f.src_img);
+                const auto frame_index = video_frame_index.load();
+                cv::Mat annotated = f.src_img.clone();
+                std::ostringstream label;
+                label << SerialTrace::wall_now() << "  #" << frame_index;
+                cv::putText(
+                    annotated,
+                    label.str(),
+                    cv::Point(12, 36),
+                    cv::FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    cv::Scalar(0, 255, 0),
+                    2,
+                    cv::LINE_AA
+                );
+                if (video_saver->write_frame(annotated)) {
+                    // 只有真正进入 VideoWriter 队列的帧才记录，视频帧号从 0 连续计数。
+                    if (serial_trace) {
+                        serial_trace->log_video(f.timestamp, frame_index);
+                    }
+                    video_frame_index.fetch_add(1);
+                }
             }
             return std::make_tuple(std::optional<CameraIO::second_type>(std::nullopt));
         });
@@ -725,13 +742,11 @@ int main(int argc, char** argv) {
         GimbalCmd cmd {
             .appear = false,
         };
-        int command_target_key = -1;
         auto shoot_in_gimbal_odom =
             tf->pose_a_in_b(SimpleFrame::SHOOT, SimpleFrame::GIMBAL_ODOM, Clock::now());
         auto gimbal_in_gimbal_odom =
             tf->pose_a_in_b(SimpleFrame::GIMBAL, SimpleFrame::GIMBAL_ODOM, Clock::now());
         if (a_target.check()) {
-            command_target_key = std::to_underlying(a_target.target_number);
             very_aimer.set_operator_offset(operator_offset);
             cmd = very_aimer.very_aim(
                 a_target,
@@ -742,7 +757,6 @@ int main(int argc, char** argv) {
             );
 
         } else if (r_target.check()) {
-            command_target_key = 1000;
             rune_aimer.set_operator_offset(operator_offset);
             cmd =
                 rune_aimer.aim(r_target, bullet_speed, shoot_in_gimbal_odom, gimbal_in_gimbal_odom);
@@ -755,84 +769,72 @@ int main(int argc, char** argv) {
             // 每帧 18 字节 = id1{float yaw, float pitch} + id2{int32 fire_flag}。
             // 角度是绝对角（度）：yaw 同向；视觉 pitch 抬头为正，固件 IMU Pitch 抬头为负，
             // 因此只在发送边界乘 pitch_sign（见 config/dong.yaml，哨兵实机验证为 -1）。
-            // 移植校内赛 SrmLink 策略：100 Hz 只发最新值，丢目标后保持最后角度并关闭开火。
-            const auto now = Clock::now();
-            if (!command_guard.has_output()) {
-                if (const auto telemetry = serial->latest_gimbal_angles()) {
-                    command_guard.seed(telemetry->first, telemetry->second, now);
-                }
-            }
+            // 打弹判定保持原版：very_aimer 的 cmd.fire_advice 直接下发，不再经过
+            // VisionCommandGuard 的 acquire / settle / alignment 门控。
             const bool raw_target = cmd.appear && cmd.is_valid();
             const float raw_yaw_deg = static_cast<float>(cmd.yaw);
             const float raw_pitch_deg = static_cast<float>(pitch_sign * cmd.pitch);
             const double target_distance_m = raw_target
                 ? (cmd.aim_point.pose.translation() - shoot_in_gimbal_odom.translation()).norm()
                 : 0.0;
-            const auto guarded = command_guard.update(
-                {
-                    .target = raw_target,
-                    .target_key = command_target_key,
-                    .yaw_deg = raw_yaw_deg,
-                    .pitch_deg = raw_pitch_deg,
-                    .distance_m = target_distance_m,
-                    .fire = cmd.fire_advice,
-                },
-                now
-            );
+
+            static bool have_last_command = false;
+            static float last_yaw_deg = 0.0f;
+            static float last_pitch_deg = 0.0f;
+            if (!have_last_command) {
+                if (const auto telemetry = serial->latest_gimbal_angles()) {
+                    last_yaw_deg = static_cast<float>(telemetry->first);
+                    last_pitch_deg = static_cast<float>(telemetry->second);
+                    have_last_command = true;
+                }
+            }
+
             bool command_accepted = false;
-            if (guarded.has_output) {
-                const float guarded_yaw_deg = static_cast<float>(guarded.yaw_deg);
-                const float guarded_pitch_deg = static_cast<float>(guarded.pitch_deg);
-                const auto hold =
-                    VisionCommand::encode_hold(guarded_yaw_deg, guarded_pitch_deg);
+            const bool fire_request = raw_target && cmd.fire_advice;
+            if (raw_target) {
+                last_yaw_deg = raw_yaw_deg;
+                last_pitch_deg = raw_pitch_deg;
+                have_last_command = true;
                 command_accepted = serial->set_latest_command(
-                    guarded.tracking
-                        ? VisionCommand::encode(
-                              guarded_yaw_deg,
-                              guarded_pitch_deg,
-                              guarded.fire
-                          )
-                        : hold,
-                    hold
+                    VisionCommand::encode(raw_yaw_deg, raw_pitch_deg, fire_request),
+                    VisionCommand::encode_hold(raw_yaw_deg, raw_pitch_deg)
                 );
+            } else if (have_last_command) {
+                const auto hold = VisionCommand::encode_hold(last_yaw_deg, last_pitch_deg);
+                command_accepted = serial->set_latest_command(hold, hold);
             } else {
                 auto idle = VisionCommand::encode_idle();
                 command_accepted = serial->set_latest_command(idle, idle);
             }
-            static bool first_command_log = true;
-            static bool last_command_accepted = false;
-            static bool last_tracking = false;
-            static bool last_fire_request = false;
-            static VisionCommandGuard::State last_guard_state =
-                VisionCommandGuard::State::NoTarget;
-            static TimePoint last_command_log;
-            const bool fire_request = guarded.tracking && guarded.fire;
-            const bool command_state_changed = first_command_log
-                || command_accepted != last_command_accepted
-                || guarded.tracking != last_tracking || fire_request != last_fire_request
-                || guarded.state != last_guard_state;
-            if (command_state_changed
-                && Clock::now() - last_command_log >= std::chrono::milliseconds(100))
-            {
+
+            static TimePoint last_guard_status_log;
+            if (Clock::now() - last_guard_status_log >= std::chrono::seconds(1)) {
+                const auto serial_stats = serial->statistics();
                 AWAKENING_INFO(
-                    "Vision command: serial_ready={} raw_target={} tracking={} fire={} guard={} distance_m={} raw_yaw_deg={} raw_pitch_deg={} tx_yaw_deg={} tx_pitch_deg={}",
+                    "Guard status: state={} has_output={} serial_ready={} raw_target={} tracking={} fire={} raw_fire_advice={} target_yaw_deg={} target_pitch_deg={} enable_yaw_diff={} enable_pitch_diff={} distance_m={} raw_yaw_deg={} raw_pitch_deg={} tx_yaw_deg={} tx_pitch_deg={} serial_frames={} serial_invalid={} serial_timeouts={} serial_framing_errors={} serial_connections={}",
+                    raw_target ? "tracking" : "no_target",
+                    have_last_command,
                     command_accepted,
                     raw_target,
-                    guarded.tracking,
+                    raw_target,
                     fire_request,
-                    VisionCommandGuard::state_name(guarded.state),
+                    cmd.fire_advice,
+                    cmd.target_yaw,
+                    cmd.target_pitch,
+                    cmd.enable_yaw_diff,
+                    cmd.enable_pitch_diff,
                     target_distance_m,
                     raw_yaw_deg,
                     raw_pitch_deg,
-                    guarded.yaw_deg,
-                    guarded.pitch_deg
+                    last_yaw_deg,
+                    last_pitch_deg,
+                    serial_stats.frames,
+                    serial_stats.invalid,
+                    serial_stats.timeouts,
+                    serial_stats.framing_errors,
+                    serial_stats.connections
                 );
-                first_command_log = false;
-                last_command_accepted = command_accepted;
-                last_tracking = guarded.tracking;
-                last_fire_request = fire_request;
-                last_guard_state = guarded.state;
-                last_command_log = Clock::now();
+                last_guard_status_log = Clock::now();
             }
         }
 #ifdef USE_Daedalus

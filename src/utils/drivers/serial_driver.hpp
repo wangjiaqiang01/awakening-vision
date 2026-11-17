@@ -131,6 +131,20 @@ public:
         std::lock_guard<std::mutex> lock(telemetry_mutex_);
         return latest_gimbal_angles_;
     }
+    // 可选的逐帧 trace 回调；必须在 start() 之前设置，回调在串口 IO 线程执行，
+    // 内部应尽量短（SerialTrace 只做内存组装和带缓冲的文件写入）。
+    using TelemetryTraceCallback = std::function<void(
+        const TongjiTelemetry&, const uint8_t*, size_t, TelemetryStream::Clock::time_point
+    )>;
+    using CommandTraceCallback =
+        std::function<void(const std::vector<uint8_t>&, TelemetryStream::Clock::time_point)>;
+    void set_trace_callbacks(
+        TelemetryTraceCallback telemetry_callback,
+        CommandTraceCallback command_callback
+    ) {
+        telemetry_trace_ = std::move(telemetry_callback);
+        command_trace_ = std::move(command_callback);
+    }
 private:
     // 只有配置了同济状态回传 ID 才启用严格组帧解析；未配置的用途
     // （例如 radar_detect 的裁判/图传串口）按纯字节流处理，不做帧同步判定。
@@ -197,7 +211,9 @@ private:
                     end_connection();
                     return;
                 }
+                const auto sent = write_queue_.front();
                 write_queue_.pop_front();
+                if (command_trace_) command_trace_(sent, TelemetryStream::Clock::now());
                 if (!write_queue_.empty()) do_write(gen);
             }
         );
@@ -275,6 +291,7 @@ private:
         const bool valid = TongjiTelemetry::decode(p, n, active_.telemetry_gimbal_id,
                                                    active_.telemetry_shoot_id, state);
         if (!valid) ++invalid_;
+        if (valid && telemetry_trace_) telemetry_trace_(state, p, n, now);
         if (valid) {
             std::lock_guard<std::mutex> lock(telemetry_mutex_);
             latest_gimbal_angles_ = std::make_pair(state.yaw, state.pitch);
@@ -337,6 +354,8 @@ private:
     std::deque<std::vector<uint8_t>> write_queue_;
     std::vector<uint8_t> latest_command_, timeout_command_;
     std::optional<std::pair<float, float>> latest_gimbal_angles_;
+    TelemetryTraceCallback telemetry_trace_;
+    CommandTraceCallback command_trace_;
     static constexpr size_t kMaxQueuedFrames = 8;
     std::atomic<uint64_t> generation_{0};
     std::atomic<bool> connected_{false};
