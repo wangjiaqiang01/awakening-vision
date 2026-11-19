@@ -211,6 +211,7 @@ if(ROS2_FULL_FOUND)
 endif()
 
 awakening_add_executable(standard SOURCES src/runtime/standard.cpp LINKS ${STANDARD_LINKS})
+awakening_add_executable(pnp_frame TOOL SOURCES tests/pnp_frame.cpp LINKS ${PROJECT_NAME}_auto_aim ${PROJECT_NAME}_utils ${PROJECT_NAME}_web)
 awakening_add_executable(control_test TOOL SOURCES src/runtime/test/control_test.cpp LINKS ${PROJECT_NAME}_web)
 awakening_add_executable(calibration_capture TOOL SOURCES calibration/capture.cpp)
 awakening_add_executable(delay_test TOOL SOURCES src/runtime/test/delay_test.cpp)

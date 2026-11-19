@@ -13,6 +13,19 @@ struct ArmorTracker::Impl {
     Impl(const YAML::Node& config) {
         cfg_.load(config);
     }
+    // 只按几何尺寸判断能否关联：NO1 是大板，NO2~NO5/sentry 是小板。
+    // 数字分类器偶发跳类时，同尺寸观测仍然可以继续更新同一个目标。
+    static bool same_geometry(ArmorClass detected, ArmorClass tracked) noexcept {
+        if (detected == tracked) return true;
+        if (detected == ArmorClass::UNKNOWN || tracked == ArmorClass::UNKNOWN
+            || detected == ArmorClass::OUTPOST || tracked == ArmorClass::OUTPOST
+            || detected == ArmorClass::BASE || tracked == ArmorClass::BASE
+            || detected == ArmorClass::SENTRY || tracked == ArmorClass::SENTRY)
+        {
+            return false;
+        }
+        return (detected == ArmorClass::NO1) == (tracked == ArmorClass::NO1);
+    }
     ArmorTarget track(
         Armors& armors,
         const CameraInfo& camera_info,
@@ -74,25 +87,56 @@ struct ArmorTracker::Impl {
         };
         Armor* selected_armor = nullptr;
         auto min_dis = std::numeric_limits<double>::max();
+        bool has_compatible_geometry = false;
         for (auto& armor: armors.armors) {
             if (valid_target(armor)) {
+                const bool compatible =
+                    target.target_number == ArmorClass::UNKNOWN
+                    || same_geometry(armor.number, target.target_number);
+                if (compatible) has_compatible_geometry = true;
                 auto bbox = armor.key_points.bounding_box();
                 auto dis = utils::calculate_distance_to_img_center(
                     (bbox.tl() + bbox.br()) / 2.0,
                     camera_info.camera_matrix
                 );
+                // 目标短暂丢失后重新初始化时，优先沿用上一次的几何类别，
+                // 避免一次错误分类（例如 2 号板被识别成 1 号板）又把
+                // 大/小装甲板尺寸带进来。首次初始化也优先普通 1~5 号板，
+                // 避免把单块 no2 误判成 outpost/base 后套上 3 板/基地模型。
+                if (compatible && target.target_number != ArmorClass::UNKNOWN) {
+                    dis -= 1e6;
+                }
+                if (target.target_number == ArmorClass::UNKNOWN
+                    && armor.number != ArmorClass::OUTPOST && armor.number != ArmorClass::BASE
+                    && armor.number != ArmorClass::SENTRY
+                    && armor.number != ArmorClass::UNKNOWN)
+                {
+                    dis -= 1e5;
+                }
                 if (dis < min_dis) {
                     min_dis = dis;
                     selected_armor = &armor;
                 }
             }
         }
+        // 已经锁定过 no2 时，如果这一帧只有 no1 的误分类，不要重新初始化成
+        // 大装甲板模型；宁可等下一帧 no2 回来。否则一次跳类会把 PnP 尺度
+        // 从 4m 直接带到 2.3m/更小，并让云台按错误几何转动。
+        if (target.target_number != ArmorClass::UNKNOWN && !has_compatible_geometry) {
+            return false;
+        }
         if (!selected_armor) {
             return false;
         }
 
         Armor init_target = *selected_armor;
-        AWAKENING_INFO("init target: {}", string_by_armor_class(init_target.number));
+        const double classifier_confidence =
+            init_target.number_classifier ? init_target.number_classifier->confidence : -1.0;
+        AWAKENING_INFO(
+            "init target: {} confidence={:.3f}",
+            string_by_armor_class(init_target.number),
+            classifier_confidence
+        );
         target.reset(init_target, cfg_, armors.timestamp, frame_id, camera_info, camera_cv_in_odom);
         target.track_state.tracker_state = ArmorTarget::TrackState::DETECTING;
         return true;
@@ -103,18 +147,24 @@ struct ArmorTracker::Impl {
         const CameraInfo& camera_info,
         const ISO3& camera_cv_in_odom
     ) noexcept {
+        const auto same_geometry = [](ArmorClass detected, ArmorClass tracked) {
+            return Impl::same_geometry(detected, tracked);
+        };
         std::vector<Armor> candidates;
         candidates.reserve(armors.armors.size());
         for (const auto& a: armors.armors) {
-            if (a.number == target.target_number && a.color != ArmorColor::NONE
-                && a.color != ArmorColor::PURPLE)
-            {
+            if (a.color == ArmorColor::NONE || a.color == ArmorColor::PURPLE) continue;
+            if (a.number == target.target_number) {
                 candidates.emplace_back(a);
+                continue;
             }
-            // if (a.number == target.target_number)
-            // {
-            //     candidates.emplace_back(a);
-            // }
+            if (!same_geometry(a.number, target.target_number)) continue;
+            Armor adjusted = a;
+            adjusted.number = target.target_number;
+            // 用目标锁定的装甲板尺寸重新解 PnP；否则 no1/no2 跳类会把
+            // 同一块物理板解成完全不同的距离。
+            if (!ArmorTarget::armor_pnp(adjusted, camera_info, camera_cv_in_odom)) continue;
+            candidates.emplace_back(std::move(adjusted));
         }
         target.predict_ekf(armors.timestamp);
         auto matched_armors =

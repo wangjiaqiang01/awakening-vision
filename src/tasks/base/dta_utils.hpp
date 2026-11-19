@@ -26,8 +26,12 @@ inline void update_fsm(
     switch (state.tracker_state) {
         case TrackState::DETECTING:
             if (!found) {
+                // 单板靶/运动模糊时数字分类器会偶发跳类，一帧匹配失败就 LOST
+                // 会让目标每帧重新初始化，目标 yaw/选板随之跳变。这里给
+                // DETECTING 与 TRACKING 相同的短暂丢失宽限，超过 lost_time_thres
+                // 才真正进入 LOST。
                 state.detect_count = 0;
-                state.tracker_state = TrackState::LOST;
+                state.tracker_state = TrackState::TEMP_LOST;
                 return;
             }
             if (++state.detect_count > tracking_thres) {

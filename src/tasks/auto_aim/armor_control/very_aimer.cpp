@@ -72,6 +72,9 @@ struct VeryAimer::Impl {
         const auto& target_state = target.get_target_state();
         const auto armors_pose = target_state.get_armors_pose(target.target_number);
         const int armor_num = static_cast<int>(armors_pose.size());
+        if (armor_num <= 0) {
+            return -1;
+        }
         int i_chosen = 0;
         const double center_yaw = std::atan2(target_state.pos().y(), target_state.pos().x());
         auto delta_angle = [&](int i) {
@@ -103,35 +106,42 @@ struct VeryAimer::Impl {
         if (auto_aim_fsm == AutoAimFsm::AIM_SINGLE_ARMOR
             && target.target_number != ArmorClass::OUTPOST && armor_num > 0)
         {
-            int candidates[2] = { -1, -1 };
-            int candidate_count = 0;
-            for (int i = 0; i < armor_num && candidate_count < 2; ++i) {
-                if (std::abs(delta_angle(i)) <= 60.0 / 57.3) {
-                    candidates[candidate_count++] = i;
+            // 单板靶（测试架上只有一块实体装甲板）仍会被 EKF 展开成 4 块虚拟板。
+            // 旧逻辑按“板法向与目标中心方向的夹角”选板，目标 yaw 一有噪声就会
+            // 在前后/左右虚拟板之间跳，控制点跟着跳，云台表现为来回震。
+            // 这里改成和 srm_auto_aim 的 Planner 一致：取离枪口水平距离最近的
+            // 一块板；优先使用本帧真正匹配到的那块板，并加距离滞回避免抖动。
+            static int lock_id = -1;
+            static ArmorClass lock_class = ArmorClass::UNKNOWN;
+            if (lock_class != target.target_number) {
+                lock_id = -1;
+                lock_class = target.target_number;
+            }
+            const auto armor_distance = [&](int i) {
+                return armors_pose[i].translation().head<2>().norm();
+            };
+            int best = 0;
+            double best_distance = armor_distance(0);
+            for (int i = 1; i < armor_num; ++i) {
+                const double d = armor_distance(i);
+                if (d < best_distance) {
+                    best_distance = d;
+                    best = i;
                 }
             }
 
-            if (candidate_count > 0) {
-                int pick = -1;
-
-                if (candidate_count == 1) {
-                    pick = candidates[0];
-                    lock_id = -1;
-                } else {
-                    if (lock_id < 0 || (lock_id != candidates[0] && lock_id != candidates[1])) {
-                        lock_id = (abs_delta_angle(candidates[0]) < abs_delta_angle(candidates[1]))
-                            ? candidates[0]
-                            : candidates[1];
-                    }
-                    pick = lock_id;
-                }
-
-                if (pick >= 0 && pick < armor_num) {
-                    i_chosen = pick;
-                }
+            int chosen = best;
+            // 不让“本帧匹配到的板”覆盖最近板。单块实体板会被 EKF 展开成
+            // 多块虚拟板，last_match_id 可能在相邻虚拟板之间跳；一旦它覆盖
+            // best，控制点就会跟着出现 3~4° 台阶。这里只保留“最近板 +
+            // 距离滞回”，不引入任何旋转靶半径/角速度特化。
+            if (lock_id >= 0 && lock_id < armor_num
+                && armor_distance(lock_id) <= best_distance + 0.05)
+            {
+                chosen = lock_id;
             }
-
-            return i_chosen;
+            lock_id = chosen;
+            return chosen;
         }
         if (armor_num > 0) {
             int best_idx = -1;
@@ -160,6 +170,20 @@ struct VeryAimer::Impl {
     ) const noexcept {
         dta_utils::ControlPoint cp;
         auto p = armor_pose.translation() - shoot_in_gimbal_odom.translation();
+        const double control_distance = p.head<2>().norm();
+        // PnP 偶尔把装甲板解到枪口前 0.1~0.3 m，弹道和云台都会拿到一个
+        // 物理上不可能的控制点；这类点必须拒绝，否则云台会卡住或突然大跳。
+        if (control_distance < 0.30 || p.x() <= 0.05) {
+            cp.valid = false;
+            AWAKENING_WARN(
+                "very_aimer: get_control_point: rejected invalid aim point: [{}, {}, {}], distance: {}",
+                p.x(),
+                p.y(),
+                p.z(),
+                control_distance
+            );
+            return cp;
+        }
         auto desired_pitch_opt = ballistic_trajectory_->solve_pitch(p, bullet_speed);
         if (!desired_pitch_opt) {
             cp.valid = false;
@@ -201,6 +225,11 @@ struct VeryAimer::Impl {
         const auto& target_state = target.get_target_state();
         const int selected_armor = select_armor(target, fsm);
         auto armors_pose = target_state.get_armors_pose(target.target_number);
+        if (selected_armor < 0 || selected_armor >= static_cast<int>(armors_pose.size())) {
+            dta_utils::ControlPoint cp;
+            cp.valid = false;
+            return cp;
+        }
         if (fsm == AutoAimFsm::AIM_WHOLE_CAR_CENTER) { //瞄准中间把目标推回原来板子的位置
             auto p = target_state.pos() - shoot_in_gimbal_odom.translation();
             double center_xy_dis = std::hypot(p.x(), p.y());
@@ -231,6 +260,9 @@ struct VeryAimer::Impl {
         const int roughly_select = select_armor(hit_time_target, fsm);
         const auto __armors_pose =
             hit_time_target.get_target_state().get_armors_pose(hit_time_target.target_number);
+        if (roughly_select < 0 || roughly_select >= static_cast<int>(__armors_pose.size())) {
+            return std::nullopt;
+        }
         auto prev_pitch_and_fly_time_opt = ballistic_trajectory_->solve_pitch_and_flytime(
             __armors_pose[roughly_select].translation() - shoot_in_gimbal_odom.translation(),
             bullet_speed
@@ -319,8 +351,8 @@ struct VeryAimer::Impl {
     Trajectory<AimPoint, double> aim_center_aim_traj_;
     Trajectory<dta_utils::GimbalState, double> aim_center_target_traj_;
     dta_utils::ControlPoint aim_center_target_traj_cp0_;
-    double last_fly_time_;
-    int last_select_;
+    double last_fly_time_ = 0.0;
+    int last_select_ = -1;
     [[nodiscard]] GimbalCmd very_aim(
         const ArmorTarget& _target,
         double bullet_speed,
@@ -329,6 +361,12 @@ struct VeryAimer::Impl {
         const ISO3& gimbal_in_gimbal_odom
     ) noexcept {
         if (_target.target_number == ArmorClass::BASE) {
+            fsm = AutoAimFsm::AIM_SINGLE_ARMOR;
+        }
+        // 测试架/旋转靶上只有一块实体装甲板时，EKF 仍会展开成 4 块虚拟板。
+        // 这时不能再按整车 FSM 切到 PAIR/CENTER，否则选板会在虚拟板之间跳。
+        // 只要本帧只匹配到一块板，就强制按单板瞄准；真实整车通常同时匹配到 2~3 块。
+        if (_target.target_number != ArmorClass::OUTPOST && _target.last_match_count <= 1) {
             fsm = AutoAimFsm::AIM_SINGLE_ARMOR;
         }
         GimbalCmd cmd;
@@ -441,6 +479,25 @@ struct VeryAimer::Impl {
 
                 return true;
             };
+            auto build_hold = [&](auto& traj_gs,
+                                  auto& traj_ap,
+                                  const dta_utils::ControlPoint& _cp0,
+                                  int horizon,
+                                  double dt) {
+                // 轨迹中只要有一个预测点被 PnP 噪声推到枪口前（0.1~0.3m），
+                // 原实现会让整条轨迹构建失败，standard 随后发 idle/保持上一帧，
+                // 云台表现为突然不动。这里退化为“保持当前有效控制点”的
+                // 常值轨迹，至少不会丢输出，也不会把非法点送给 MPC。
+                const int half = horizon / 2;
+                for (int i = -half; i <= half; ++i) {
+                    dta_utils::GimbalState gs;
+                    gs.aim_id = _cp0.aim_id;
+                    gs.yaw_state.p = 0.0;
+                    gs.pitch_state.p = 0.0;
+                    traj_gs.push_back(gs, i * dt);
+                    traj_ap.push_back(_cp0.aim_point, i * dt);
+                }
+            };
             limit_traj_cp0_ = cp0;
             limit_traj_.clear();
             aim_traj_.clear();
@@ -448,7 +505,12 @@ struct VeryAimer::Impl {
             aim_traj_.reserve(horizon + 1);
 
             if (!build_traj(limit_traj_, aim_traj_, limit_traj_cp0_, fsm, horizon, dt)) {
-                return cmd;
+                AWAKENING_WARN(
+                    "very_aimer: build_traj failed, holding current valid control point"
+                );
+                limit_traj_.clear();
+                aim_traj_.clear();
+                build_hold(limit_traj_, aim_traj_, limit_traj_cp0_, horizon, dt);
             }
             if (!mpc_traj_) {
                 limit_traj_.build_limit(params_.max_yaw_acc, params_.max_pitch_acc, time_in_traj);

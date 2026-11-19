@@ -179,6 +179,8 @@ public:
     bool is_inited = false;
     bool jumped = false;
     int last_match_id = -1;
+    // 本帧实际匹配到的装甲板数量；单板靶始终为 1，用它避免把单板当成四板车。
+    int last_match_count = 0;
     std::optional<std::pair<bool, std::vector<bool>>> outpost_has_all_and_has_set_ids;
     TrackState track_state;
     TimePoint last_update;
@@ -195,6 +197,7 @@ public:
         target.is_inited = this->is_inited;
         target.jumped = this->jumped;
         target.last_match_id = this->last_match_id;
+        target.last_match_count = this->last_match_count;
         target.outpost_has_all_and_has_set_ids = this->outpost_has_all_and_has_set_ids;
         target.this_id = this->this_id;
         target.update_count = this->update_count;

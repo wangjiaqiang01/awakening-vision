@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
     cv::CommandLineParser cli(argc, argv, keys);
     if (cli.has("help")) { cli.printMessage(); return 0; }
     try {
-        const auto config_path = cli.get<std::string>(0);
+        const auto config_path = cli.get<std::string>("@robot-config");
         const auto settings_path = cli.get<std::string>("settings");
         const auto output = fs::path(cli.get<std::string>("output"));
         const auto camera_key = cli.get<std::string>("camera-key");

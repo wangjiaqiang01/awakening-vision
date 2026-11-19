@@ -20,16 +20,19 @@ serial:
   command_tx_hz: 100
   command_timeout_ms: 500
   command_guard:
-    acquire_ms: 120
-    fire_settle_ms: 150
-    min_distance_m: 0.5
-    max_distance_m: 20.0
-    max_yaw_jump_deg: 4.0
-    max_pitch_jump_deg: 4.0
-    max_yaw_rate_deg_s: 90.0
-    max_pitch_rate_deg_s: 60.0
-    filter_time_constant_s: 0.03
-    fire_alignment_tolerance_deg: 0.5
+    # raw = 发送边界完全旁路 command_guard；不是只把阈值放宽。
+    profile: raw
+    acquire_ms: 0
+    fire_settle_ms: 0
+    min_distance_m: 0.01
+    max_distance_m: 100.0
+    max_yaw_jump_deg: 360.0
+    max_pitch_jump_deg: 180.0
+    max_yaw_rate_deg_s: 1000000000.0
+    max_pitch_rate_deg_s: 1000000000.0
+    filter_time_constant_s: 0.0
+    fire_alignment_tolerance_deg: 180.0
+    reset_on_target_change: false
   # 视觉 pitch（抬头为正）-> 固件 IMU Pitch 的符号，只在发送边界生效。
   # 哨兵（IMU 安装 .Pitch = 0）实机验证为 -1；IMU 倒装的车（如六轮步兵 .Pitch = 180）应改为 1。
   # 首次上车先小角度点动：云台朝反方向走就取反，改这里即可，无需重新编译。
@@ -42,8 +45,8 @@ record:
 
 tf:
   camera_in_gimbal:
-    t: [0.1208310801128429, 0.0005078557103017583, 0.0395482404170795]
-    R: [0.9989122197140633, 0.005092530601463974, -0.04635130459864157, -0.005452938575046963, 0.9999558517339936, -0.007652453452340335, 0.046310287915534154, 0.007896880081185633, 0.9988958887282317]
+    t: [0.1243369959333309, -0.00949820524867397, 0.04305656137429936]
+    R: [0.9993236802378205, 0.010992999275633908, -0.03509039872763259, -0.01215028318659872, 0.9993835055584672, -0.03293902603530663, 0.03470666700251979, 0.033343107002723305, 0.9988411707979308]
   shoot_in_gimbal:
     t: [0.1,0.0,0.0]
     R: [1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0]
@@ -101,6 +104,7 @@ armor_detector:
     enable: true
     model_path: ${ROOT_DIR}/model/mlp.onnx
     label_path: ${ROOT_DIR}/model/label.txt
+    confidence_threshold: 0.35
   color_classifier:
     enable: true
     diff_threshold: 20.0
@@ -145,14 +149,18 @@ armor_tracker:
   lost_time_thres_outpost: 2.0
   tracking_thres: 5
 
-  armor_match_gate: 100.0
-  armor_match_gate_not_all_init: 200.0
+  # 4m 单板靶在云台快速运动/曝光爬升时有运动模糊，20px 中心误差
+  # （100/5=20px）会把正常观测判成 out of gate，导致目标反复丢失。
+  # 放宽到约 40px / 80px；再大就会接近相邻虚拟板的间距（4m 处约 50px），
+  # 容易把观测匹配到错误板面，所以不继续放大。
+  armor_match_gate: 200.0
+  armor_match_gate_not_all_init: 400.0
   armor_match_w_center_err: 5.0
   armor_match_w_angle_err: 10.0
   armor_match_w_side_length_err: 1.0
 
   qxyz_common: [30.0, 30.0, 1.0]
-  qyaw_common: 100.0
+  qyaw_common: 10.0
   qxyz_output: [1.0, 1.0, 0.5]
   qyaw_output: 0.01
   q_r: 0.0000001
@@ -187,16 +195,19 @@ very_aimer:
   # base_pitch_offset: -0.0
   sample_total_time: 1.0
   
-  sample_horizon: 200
+  # 与 srm_auto_aim Planner 对齐：HORIZON=100, DT=0.01, 输出 index=50
+  sample_horizon: 100
 
   fire_delay_min: 0.01
   fire_delay_max: 0.05
   
-  max_yaw_acc: 40
-  max_pitch_acc: 50
+  # 与 srm_auto_aim Planner 对齐：max_yaw_acc=50, max_pitch_acc=100
+  max_yaw_acc: 50
+  max_pitch_acc: 100
   
 
-  prediction_delay: 0.00
+  # srm_auto_aim Planner: 快速靶 0.030 / 慢速靶 0.015
+  prediction_delay: 0.015
   aim_center_more_prediction_time: 0.0
 
   shooting_range_h: 0.12
@@ -334,15 +345,15 @@ camera:
     camera_matrix:
       rows: 3
       cols: 3
-      data: [1865.641913044752, 0.0, 735.5042192490607,
-             0.0, 1866.7127673089242, 536.3146748667901,
+      data: [1821.4481978384658, 0.0, 736.6216681635449,
+             0.0, 1820.9277593459756, 534.956060803036,
              0.0, 0.0, 1.0]
     distortion_model: plumb_bob
     distortion_coefficients:
       rows: 1
       cols: 5
-      data: [-0.05976764311906039, 0.14920651154797024,
-             -0.0008865195090253409, -0.00008154801535010237, 0.0]
+      data: [-0.06840692473700945, 0.13119219768370766,
+             -0.0010804481976403753, -0.0006167391471516121, 0.0]
     rectification_matrix:
       rows: 3
       cols: 3
@@ -352,8 +363,8 @@ camera:
     projection_matrix:
       rows: 3
       cols: 4
-      data: [1865.641913044752, 0.0, 735.5042192490607, 0.0,
-             0.0, 1866.7127673089242, 536.3146748667901, 0.0,
+      data: [1821.4481978384658, 0.0, 736.6216681635449, 0.0,
+             0.0, 1820.9277593459756, 534.956060803036, 0.0,
              0.0, 0.0, 1.0, 0.0]
     #12mm
     # image_width: 1440
@@ -418,7 +429,7 @@ armor_omni:
     match_gate_at_1m: 500.0
     match_gate_not_all_init_at_1m: 3000.0
     qxyz_common: [20.0, 20.0, 1.0]
-    qyaw_common: 10.0
+    qyaw_common: 100.0
     qxyz_output: [10.0, 10.0, 0.5]
     qyaw_output: 0.01
     q_r: 0.0000001

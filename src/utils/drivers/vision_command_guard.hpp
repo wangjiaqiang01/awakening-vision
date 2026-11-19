@@ -22,6 +22,7 @@ public:
         double max_pitch_rate_deg_s = 60.0;
         double filter_time_constant_s = 0.03;
         double fire_alignment_tolerance_deg = 0.5;
+        bool reset_on_target_change = true;
     };
 
     struct Input {
@@ -92,7 +93,7 @@ public:
             return hold(State::Acquiring, now);
         }
 
-        if (input.target_key != candidate_key_) {
+        if (params_.reset_on_target_change && input.target_key != candidate_key_) {
             start_candidate(input, now);
             return hold(State::TargetChanged, now);
         }

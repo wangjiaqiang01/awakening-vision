@@ -15,5 +15,5 @@ max_handeye_translation_rms_m: 0.02
 R_gimbal2imubody: [1, 0, 0, 0, 1, 0, 0, 0, 1]
 # 仅在云台停稳后按 s；姿态协议没有设备时间戳，因此不支持运动中精确同步。
 pose_max_age_ms: 100
-pose_stable_window_ms: 300
+pose_stable_window_ms: 1000
 pose_stable_angle_deg: 0.3

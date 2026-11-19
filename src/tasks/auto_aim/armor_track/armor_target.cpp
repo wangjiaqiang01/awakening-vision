@@ -350,8 +350,10 @@ int ArmorTarget::update(
     const ISO3& camera_cv_in_odom
 ) {
     if (matched_armors.empty() && matched_lights.empty()) {
+        last_match_count = 0;
         return 0;
     }
+    last_match_count = static_cast<int>(matched_armors.size());
     uvmeasure_ctx.camera_cv_in_odom = camera_cv_in_odom;
 
     std::vector<std::shared_ptr<RobotStateESEKF::ObsBase>> obs;
@@ -473,6 +475,22 @@ int ArmorTarget::update(
     std::vector<bool> used_id(armor_num(), false);
     {
         for (auto& [id, armor]: matched_armors) {
+            // 通用防护：更新前先做一次 PnP，0.11m/0.2m 这类物理上不可能的
+            // 距离一旦进入 EKF，会把 target 中心和虚拟板位置一起拉走。
+            // 这里不依赖旋转靶半径、角速度等特化假设。
+            if (!armor_pnp(armor, camera_info, camera_cv_in_odom)) {
+                AWAKENING_WARN("armor_target: drop armor {} due to PnP failure", id);
+                continue;
+            }
+            const double pnp_distance = armor.pose.translation().norm();
+            if (!std::isfinite(pnp_distance) || pnp_distance < 0.30) {
+                AWAKENING_WARN(
+                    "armor_target: drop armor {} due to invalid pnp distance {:.3f} m",
+                    id,
+                    pnp_distance
+                );
+                continue;
+            }
             jumped |= (id != 0);
             update_outpost_state(id);
             last_match_id = id;
