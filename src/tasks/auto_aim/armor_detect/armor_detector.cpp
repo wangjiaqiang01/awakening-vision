@@ -1,5 +1,6 @@
 #include "armor_detector.hpp"
 #include "armor_infer.hpp"
+#include "yolo_detector.hpp"
 #include "tasks/auto_aim/type.hpp"
 #include "tasks/base/web.hpp"
 #include "utils/logger.hpp"
@@ -32,6 +33,7 @@ namespace awakening::auto_aim {
 struct ArmorDetector::Impl {
     static constexpr const char* OPENVINO = "openvino";
     static constexpr const char* TENSORRT = "tensorrt";
+    static constexpr const char* YOLO = "yolo";
     struct Params {
         struct NumberClassifierParams {
             std::string model_path;
@@ -103,7 +105,9 @@ struct ArmorDetector::Impl {
             init_number_classifier();
         }
         auto backend = config["backend"].as<std::string>();
-        if (backend != "opencv") {
+        if (backend == YOLO) {
+            yolo_detector_ = std::make_unique<YoloDetector>(config["yolo_detector"]);
+        } else if (backend != "opencv") {
             armor_infer_ = ArmorInfer::create(config["net_detector"]["armor_infer"]);
             const double scale = armor_infer_->use_norm() ? 1.0 / 255.0f : 1.0f;
             auto format = armor_infer_->target_format();
@@ -748,11 +752,57 @@ struct ArmorDetector::Impl {
         }
         return { std::move(lights), std::move(result) };
     }
+    std::tuple<std::vector<Light>, std::vector<Armor>> detect_yolo(
+        const CommonFrame& frame,
+        const cv::Rect& net_focus
+    ) const {
+        const auto& src_img = frame.img_frame.src_img;
+        cv::Mat bgr_img;
+        switch (frame.img_frame.format) {
+            case PixelFormat::BGR:
+                bgr_img = src_img;
+                break;
+            case PixelFormat::RGB:
+                cv::cvtColor(src_img, bgr_img, cv::COLOR_RGB2BGR);
+                break;
+            case PixelFormat::GRAY:
+                cv::cvtColor(src_img, bgr_img, cv::COLOR_GRAY2BGR);
+                break;
+        }
+
+        std::vector<Armor> result = yolo_detector_->detect(bgr_img, net_focus);
+        if (result.empty()) {
+            return { {}, {} };
+        }
+
+        if (params_.number_classifier_params) {
+            std::vector<Armor*> batch_armors;
+            batch_armors.reserve(result.size());
+            for (auto& armor: result) {
+                if (extract_number(src_img, armor)) {
+                    batch_armors.push_back(&armor);
+                }
+            }
+            classify_number_batch(batch_armors);
+        }
+
+        for (auto& armor: result) {
+            if (params_.color_classifier_params) {
+                classify_color(src_img, armor, frame.img_frame.format);
+            }
+            armor.tidy();
+        }
+        return { {}, std::move(result) };
+    }
+
     std::tuple<std::vector<Light>, std::vector<Armor>> detect(
         const CommonFrame& frame,
         const cv::Rect& net_focus,
         const std::optional<cv::Rect>& detect_light = std::nullopt
     ) const {
+        if (yolo_detector_) {
+            return detect_yolo(frame, net_focus);
+        }
         if (net_detector_) {
             return detect_net(frame, net_focus, detect_light);
         } else {
@@ -760,6 +810,9 @@ struct ArmorDetector::Impl {
         }
     }
     double get_net_wh_ratio() const noexcept {
+        if (yolo_detector_) {
+            return yolo_detector_->input_w() / static_cast<double>(yolo_detector_->input_h());
+        }
         if (net_detector_) {
             return armor_infer_->input_w() / static_cast<double>(armor_infer_->input_h());
         }
@@ -768,6 +821,7 @@ struct ArmorDetector::Impl {
 
     utils::NetDetectorBase::Ptr net_detector_;
     ArmorInfer::Ptr armor_infer_;
+    mutable std::unique_ptr<YoloDetector> yolo_detector_;
 };
 ArmorDetector::ArmorDetector(const YAML::Node& config) {
     _impl = std::make_unique<Impl>(config);

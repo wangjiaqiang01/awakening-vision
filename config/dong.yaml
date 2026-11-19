@@ -82,7 +82,18 @@ auto_exposure:
 
 armor_detector:
   max_infer_num: 5
-  backend: openvino
+  # yolo: 使用 srm_auto_aim 迁移的 YOLOv8 关键点模型；改成 openvino 可回退到原 TUP 路径
+  backend: yolo
+  # YOLOv8 姿态模型（srm_auto_aim 迁移）。把 backend 改为 "yolo" 后启用；
+  # 原 TUP/OpenVINO 路径保持不变，便于回退对比。
+  yolo_detector:
+    model_path: ${ROOT_DIR}/model/yolov8.xml
+    device_name: "CPU"
+    conf_threshold: 0.7
+    nms_threshold: 0.3
+    input_w: 416
+    input_h: 416
+    class_num: 2
   net_detector:
     openvino:
       model_path: ${ROOT_DIR}/model/opt-1208-001.onnx
