@@ -219,7 +219,7 @@ public:
     [[nodiscard]] inline int armor_num() const noexcept {
         return armor_num_by_armor_class(target_number);
     }
-    void write_log();
+    void write_log(int select_id = -1);
 
 private:
     armor_point_motion_model::State target_state;

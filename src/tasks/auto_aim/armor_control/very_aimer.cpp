@@ -106,42 +106,35 @@ struct VeryAimer::Impl {
         if (auto_aim_fsm == AutoAimFsm::AIM_SINGLE_ARMOR
             && target.target_number != ArmorClass::OUTPOST && armor_num > 0)
         {
-            // 单板靶（测试架上只有一块实体装甲板）仍会被 EKF 展开成 4 块虚拟板。
-            // 旧逻辑按“板法向与目标中心方向的夹角”选板，目标 yaw 一有噪声就会
-            // 在前后/左右虚拟板之间跳，控制点跟着跳，云台表现为来回震。
-            // 这里改成和 srm_auto_aim 的 Planner 一致：取离枪口水平距离最近的
-            // 一块板；优先使用本帧真正匹配到的那块板，并加距离滞回避免抖动。
-            static int lock_id = -1;
-            static ArmorClass lock_class = ArmorClass::UNKNOWN;
-            if (lock_class != target.target_number) {
-                lock_id = -1;
-                lock_class = target.target_number;
-            }
-            const auto armor_distance = [&](int i) {
-                return armors_pose[i].translation().head<2>().norm();
-            };
-            int best = 0;
-            double best_distance = armor_distance(0);
-            for (int i = 1; i < armor_num; ++i) {
-                const double d = armor_distance(i);
-                if (d < best_distance) {
-                    best_distance = d;
-                    best = i;
+            int candidates[2] = { -1, -1 };
+            int candidate_count = 0;
+            for (int i = 0; i < armor_num && candidate_count < 2; ++i) {
+                if (std::abs(delta_angle(i)) <= 60.0 / 57.3) {
+                    candidates[candidate_count++] = i;
                 }
             }
 
-            int chosen = best;
-            // 不让“本帧匹配到的板”覆盖最近板。单块实体板会被 EKF 展开成
-            // 多块虚拟板，last_match_id 可能在相邻虚拟板之间跳；一旦它覆盖
-            // best，控制点就会跟着出现 3~4° 台阶。这里只保留“最近板 +
-            // 距离滞回”，不引入任何旋转靶半径/角速度特化。
-            if (lock_id >= 0 && lock_id < armor_num
-                && armor_distance(lock_id) <= best_distance + 0.05)
-            {
-                chosen = lock_id;
+            if (candidate_count > 0) {
+                int pick = -1;
+
+                if (candidate_count == 1) {
+                    pick = candidates[0];
+                    lock_id = -1;
+                } else {
+                    if (lock_id < 0 || (lock_id != candidates[0] && lock_id != candidates[1])) {
+                        lock_id = (abs_delta_angle(candidates[0]) < abs_delta_angle(candidates[1]))
+                            ? candidates[0]
+                            : candidates[1];
+                    }
+                    pick = lock_id;
+                }
+
+                if (pick >= 0 && pick < armor_num) {
+                    i_chosen = pick;
+                }
             }
-            lock_id = chosen;
-            return chosen;
+
+            return i_chosen;
         }
         if (armor_num > 0) {
             int best_idx = -1;
@@ -361,12 +354,6 @@ struct VeryAimer::Impl {
         const ISO3& gimbal_in_gimbal_odom
     ) noexcept {
         if (_target.target_number == ArmorClass::BASE) {
-            fsm = AutoAimFsm::AIM_SINGLE_ARMOR;
-        }
-        // 测试架/旋转靶上只有一块实体装甲板时，EKF 仍会展开成 4 块虚拟板。
-        // 这时不能再按整车 FSM 切到 PAIR/CENTER，否则选板会在虚拟板之间跳。
-        // 只要本帧只匹配到一块板，就强制按单板瞄准；真实整车通常同时匹配到 2~3 块。
-        if (_target.target_number != ArmorClass::OUTPOST && _target.last_match_count <= 1) {
             fsm = AutoAimFsm::AIM_SINGLE_ARMOR;
         }
         GimbalCmd cmd;

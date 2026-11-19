@@ -998,7 +998,9 @@ int main(int argc, char** argv) {
                 dbg->type =
                     (mode == Mode::AutoAim) ? VisionDebugCtx::AUTO_AIM : VisionDebugCtx::AUTO_BUFF;
                 auto __rune_target = rune_target.read();
-                __armor_target.write_log();
+                int current_select_id = -1;
+                if (dbg) current_select_id = dbg->gimbal_cmd.get().select_id;
+                __armor_target.write_log(current_select_id);
                 __rune_target.write_log();
                 wheel_odometry.write_log();
                 auto img_now = dbg->img_frame.get().timestamp;

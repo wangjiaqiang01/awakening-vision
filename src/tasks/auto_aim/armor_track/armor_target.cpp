@@ -57,12 +57,14 @@ namespace {
 
 } // namespace
 
-void ArmorTarget::write_log() {
+void ArmorTarget::write_log(int select_id) {
     Web::write_log("armor_target", [&](auto& j) {
         j["timestamp"] =
             static_cast<int>(std::chrono::duration<double>(last_update.time_since_epoch()).count());
         j["target_number"] = string_by_armor_class(target_number);
         j["track_state"] = TrackState::string_by_state(track_state.tracker_state);
+        j["select_id"] = select_id;
+        j["match_count"] = last_match_count;
         auto& j_target_state = j["target_state"];
         j_target_state["cx"] = Web::val(target_state.pos().x());
         j_target_state["cy"] = Web::val(target_state.pos().y());
@@ -108,7 +110,7 @@ void ArmorTarget::reset(
     if (target_number == ArmorClass::OUTPOST) {
         p0.diagonal()[idx::OUTPOST01DZ] = p0.diagonal()[idx::OUTPOST02DZ] = 1;
     }
-    p0.diagonal()[idx::VYAW] = 100;
+    p0.diagonal()[idx::VYAW] = 25;
     if (a.number == ArmorClass::OUTPOST) {
         r_pre = 0.2765;
     } else if (a.number == ArmorClass::BASE) {
