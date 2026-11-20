@@ -82,9 +82,10 @@ auto_exposure:
 
 armor_detector:
   max_infer_num: 1
-  # yolo: 使用 同济迁移的 YOLOv8 关键点模型；改成 openvino 可回退到原 TUP 路径
-  backend: yolo
-  # YOLOv8 姿态模型（同济 迁移）。把 backend 改为 "yolo" 后启用；
+  # 当前使用 OpenVINO 后端；YOLOv8 关键点路径保留在 yolo_detector 下，便于回退对比。
+  # yolo: 使用 同济迁移的 YOLOv8 关键点模型；openvino: 原 TUP/OpenVINO 路径。
+  backend: openvino
+  # YOLOv8 姿态模型（同济 迁移）。将 backend 改回 "yolo" 后启用。
   # 原 TUP/OpenVINO 路径保持不变，便于回退对比。
   yolo_detector:
     model_path: ${ROOT_DIR}/model/yolov8.xml

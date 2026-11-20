@@ -19,15 +19,15 @@ template<ArmorType T>
 struct ArmorTypeTraits; // declare
 template<>
 struct ArmorTypeTraits<ArmorType::SimpleSmall> {
-    // 与 vision-d 对齐：SMALL_ARMOR_WIDTH=135mm，LIGHTBAR_LENGTH=56mm
-    static constexpr double WIDTH = 135.0 / 1000.0;
-    static constexpr double HEIGHT = 56.0 / 1000.0;
+    // WUST-RM/awakening 基线：SMALL_ARMOR_WIDTH=133mm，LIGHTBAR_LENGTH=50mm
+    static constexpr double WIDTH = 133.0 / 1000.0;
+    static constexpr double HEIGHT = 50.0 / 1000.0;
 };
 template<>
 struct ArmorTypeTraits<ArmorType::Large> {
-    // 与 vision-d 对齐：BIG_ARMOR_WIDTH=230mm，LIGHTBAR_LENGTH=56mm
-    static constexpr double WIDTH = 230.0 / 1000.0;
-    static constexpr double HEIGHT = 56.0 / 1000.0;
+    // WUST-RM/awakening 基线：BIG_ARMOR_WIDTH=225mm，LIGHTBAR_LENGTH=50mm
+    static constexpr double WIDTH = 225.0 / 1000.0;
+    static constexpr double HEIGHT = 50.0 / 1000.0;
 };
 template<typename PointT, ArmorType T>
 struct ArmorKeyPoint3D {

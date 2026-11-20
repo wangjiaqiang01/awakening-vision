@@ -1,6 +1,7 @@
 from flask import Flask, render_template, Response, jsonify, request
 import time
 import json
+import math
 import socket
 import os
 import logging
@@ -256,6 +257,30 @@ def mjpeg_stream():
         )
 
 
+def add_target_distance(data):
+    """在 /log 返回的 armor_target 下补充目标距离（odom 原点）。"""
+    if not isinstance(data, dict):
+        return data
+
+    target = data.get("armor_target")
+    if not isinstance(target, dict):
+        return data
+
+    state = target.get("target_state")
+    if not isinstance(state, dict):
+        return data
+
+    try:
+        cx = float(state["cx"])
+        cy = float(state["cy"])
+        cz = float(state["cz"])
+    except (KeyError, TypeError, ValueError):
+        return data
+
+    target["distance_m"] = round(math.sqrt(cx * cx + cy * cy + cz * cz), 3)
+    return data
+
+
 @app.route("/")
 def index():
     url = f"http://{get_local_ip()}:{port}"
@@ -286,7 +311,9 @@ def get_data():
 @app.route("/log")
 def get_log():
     try:
-        return no_store_json(read_json_cached(log_path))
+        data = read_json_cached(log_path)
+        add_target_distance(data)
+        return no_store_json(data)
     except Exception as e:
         return no_store_json({"error": str(e)}, 500)
 
