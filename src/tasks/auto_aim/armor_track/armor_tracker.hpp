@@ -16,6 +16,8 @@ public:
     );
     int get_count();
     void reset_count();
+    int get_ekf_count();
+    void reset_ekf_count();
     void set_sentry(bool is_sentry);
     AWAKENING_IMPL_DEFINITION(ArmorTracker)
 };

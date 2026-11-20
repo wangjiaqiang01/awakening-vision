@@ -21,11 +21,18 @@ struct ArmorTracker::Impl {
     ) {
         auto& cur = target_buf_[cur_target_idx_];
         auto& pre = target_buf_[pre_target_idx_];
+        bool ekf_updated_this_frame = false;
         auto process = [&](int idx) {
             auto& t = target_buf_[idx];
-            bool found = (t.track_state.tracker_state == ArmorTarget::TrackState::LOST)
-                ? init_target(t, armors, frame_id, camera_info, camera_cv_in_odom)
-                : update_target(t, armors, camera_info, camera_cv_in_odom);
+            bool found = false;
+            if (t.track_state.tracker_state == ArmorTarget::TrackState::LOST) {
+                found = init_target(t, armors, frame_id, camera_info, camera_cv_in_odom);
+            } else {
+                found = update_target(t, armors, camera_info, camera_cv_in_odom);
+                if (found) {
+                    ekf_updated_this_frame = true;
+                }
+            }
             update_fsm(found, idx, armors.timestamp);
             return found;
         };
@@ -50,6 +57,10 @@ struct ArmorTracker::Impl {
             ),
             armors.lights.end()
         );
+
+        if (ekf_updated_this_frame) {
+            ++ekf_count_;
+        }
 
         return target_buf_[cur_target_idx_].fast_copy_without_ekf(); //下游不让用ekf
     }
@@ -157,6 +168,7 @@ struct ArmorTracker::Impl {
     }
 
     int found_count_ = 0;
+    int ekf_count_ = 0;
 
     size_t cur_target_idx_ = 0;
     size_t pre_target_idx_ = 1;
@@ -180,6 +192,12 @@ int ArmorTracker::get_count() {
 }
 void ArmorTracker::reset_count() {
     _impl->found_count_ = 0;
+}
+int ArmorTracker::get_ekf_count() {
+    return _impl->ekf_count_;
+}
+void ArmorTracker::reset_ekf_count() {
+    _impl->ekf_count_ = 0;
 }
 void ArmorTracker::set_sentry(bool is_sentry) {
     _impl->set_sentry(is_sentry);

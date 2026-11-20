@@ -113,6 +113,7 @@ struct LogCtx {
     int solve_count = 0;
     int serial_count = 0;
     int found_count = 0;
+    int ekf_count = 0;
     double latency_ms_total = 0.0;
     void reset() {
         *this = {};
@@ -702,7 +703,9 @@ int main(int argc, char** argv) {
                 }
 
                 log_ctx.found_count += armor_tracker.get_count();
+                log_ctx.ekf_count += armor_tracker.get_ekf_count();
                 armor_tracker.reset_count();
+                armor_tracker.reset_ekf_count();
                 if (dbg) {
                     dbg->armors.set(armors);
                 }
@@ -976,10 +979,11 @@ int main(int argc, char** argv) {
     s.add_rate_source<>("logger", 1.0, [&]() {
         double avg_latency_ms = log_ctx.latency_ms_total / log_ctx.detect_count;
         AWAKENING_INFO(
-            "detect: {} track: {} found: {} solve: {} serial: {} camera: {} avg_latency: {:.3} ms",
+            "detect: {} track: {} found: {} ekf_frames: {} solve: {} serial: {} camera: {} avg_latency: {:.3} ms",
             log_ctx.detect_count,
             log_ctx.track_count,
             log_ctx.found_count,
+            log_ctx.ekf_count,
             log_ctx.solve_count,
             log_ctx.serial_count,
             log_ctx.camera_count,
