@@ -115,7 +115,6 @@ armor_detector:
     enable: true
     model_path: ${ROOT_DIR}/model/mlp.onnx
     label_path: ${ROOT_DIR}/model/label.txt
-    confidence_threshold: 0.35
   color_classifier:
     enable: true
     diff_threshold: 20.0

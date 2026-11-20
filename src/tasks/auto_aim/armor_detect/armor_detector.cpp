@@ -37,15 +37,8 @@ struct ArmorDetector::Impl {
     struct Params {
         struct NumberClassifierParams {
             std::string model_path;
-            // 与校内赛 srm_auto_aim 的 min_confidence 对齐：低于阈值的
-            // 数字分类结果直接当 UNKNOWN，避免单板靶在 4m/运动模糊时
-            // no2 被判成 no1/outpost，把目标几何和 PnP 尺度整体带偏。
-            double confidence_threshold = 0.35;
             void load(const YAML::Node& config) {
                 model_path = replace_root_dir(config["model_path"].as<std::string>());
-                if (config["confidence_threshold"]) {
-                    confidence_threshold = config["confidence_threshold"].as<double>();
-                }
             }
         };
         std::optional<NumberClassifierParams> number_classifier_params;
@@ -362,9 +355,7 @@ struct ArmorDetector::Impl {
             auto* armor = valid_armors[i];
             armor->number_classifier->confidence = confidence;
 
-            if (label >= 0 && label < (int)label_map.size()
-                && confidence >= params_.number_classifier_params->confidence_threshold)
-            {
+            if (label >= 0 && label < (int)label_map.size()) {
                 armor->number_classifier->number = label_map[label];
             } else {
                 armor->number_classifier->number = ArmorClass::UNKNOWN;
