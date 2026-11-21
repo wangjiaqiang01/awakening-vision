@@ -43,6 +43,11 @@ use_sim: false
 record:
  enable: true
 
+debug_timing:
+  enable: true
+  every_n: 10
+  path: log/timing.csv
+
 tf:
   camera_in_gimbal:
     t: [0.1243369959333309, -0.00949820524867397, 0.04305656137429936]
@@ -81,7 +86,7 @@ auto_exposure:
   control_interval_ms: 300
 
 armor_detector:
-  max_infer_num: 1
+  max_infer_num: 5
   # 当前使用 OpenVINO 后端；YOLOv8 关键点路径保留在 yolo_detector 下，便于回退对比。
   # yolo: 使用 同济迁移的 YOLOv8 关键点模型；openvino: 原 TUP/OpenVINO 路径。
   backend: openvino
@@ -98,7 +103,7 @@ armor_detector:
   net_detector:
     openvino:
       model_path: ${ROOT_DIR}/model/opt-1208-001.onnx
-      device_name: "CPU"
+      device_name: "GPU"
       perf_mode: "THROUGHPUT"
       # priority: "HIGH"
       # scheduling_core_type: "PCORE_ONLY"
@@ -158,20 +163,22 @@ armor_tracker:
 
   lost_time_thres: 0.5
   lost_time_thres_outpost: 2.0
-  tracking_thres: 5
+  tracking_thres: 10
 
-  # 4m 单板靶在云台快速运动/曝光爬升时有运动模糊，20px 中心误差
-  # （100/5=20px）会把正常观测判成 out of gate，导致目标反复丢失。
-  # 放宽到约 40px / 80px；再大就会接近相邻虚拟板的间距（4m 处约 50px），
-  # 容易把观测匹配到错误板面，所以不继续放大。
-  armor_match_gate: 200.0
-  armor_match_gate_not_all_init: 400.0
+  # 选帧开关：1=关闭；5=每 5 个“本可进入 EKF 的有效观测帧”只真正更新 1 次。
+  # 仅降低 EKF 测量更新率，detector 仍按原帧率跑；用于模拟同济 20Hz 观测。
+  ekf_update_stride: 1
+
+  # 匹配门控：100/5=20px 中心误差；非初始帧 200/5=40px。
+  # 从 200/400 收回一半，观察武科灯条模型下的 found/ekf_frames 是否下降。
+  armor_match_gate: 50.0
+  armor_match_gate_not_all_init: 100.0
   armor_match_w_center_err: 5.0
   armor_match_w_angle_err: 10.0
   armor_match_w_side_length_err: 1.0
 
   qxyz_common: [30.0, 30.0, 1.0]
-  qyaw_common: 10.0
+  qyaw_common: 1.0
   qxyz_output: [1.0, 1.0, 0.5]
   qyaw_output: 0.01
   q_r: 0.0000001
@@ -199,7 +206,8 @@ auto_aim_fsm:
   transfer_time: 0.5
 
 very_aimer:
-  type: mpc
+  # WUST 原版没有 type；当前 constructor 必填，显式 limit 即非 MPC 路径
+  type: limit
   base_yaw_offset: 0.3
   base_pitch_offset: -2.3
   # base_yaw_offset: -0.0
@@ -236,7 +244,7 @@ rune_detector:
   net_detector:
     openvino:
       model_path: ${ROOT_DIR}/model/cb_rune.onnx
-      device_name: "CPU"
+      device_name: "GPU"
       perf_mode: "THROUGHPUT"
       # priority: "HIGH"
       # scheduling_core_type: "PCORE_ONLY"

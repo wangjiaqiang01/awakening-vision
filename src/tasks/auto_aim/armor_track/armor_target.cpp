@@ -92,6 +92,9 @@ void ArmorTarget::reset(
 ) {
     cfg = c;
     target_number = a.number;
+    // stride 选帧相位随目标重建一起归零。
+    ekf_valid_frame_count = 0;
+    last_ekf_applied = false;
     uvmeasure_ctx = {
         .armor_num = armor_num_by_armor_class(target_number),
         .id = 0,
@@ -506,21 +509,27 @@ int ArmorTarget::update(
         add_uvl_obs(light.top, light.bottom, id, is_left);
     }
     if (!obs.empty()) {
-        target_state.x = esekf->update_multi(obs);
-        target_state.timestamp = timestamp;
-        last_update = timestamp;
-        this_id = GLOBAL_ID++;
-        voter.update(
-            utils::matrix2rpy(
-                utils::so3_exp(Vec3(
-                    target_state.x[idx::C_ROT_X],
-                    target_state.x[idx::C_ROT_Y],
-                    target_state.x[idx::C_ROT_Z]
-                )),
-                utils::RPYOrder::ZYX
-            )[2],
-            timestamp
-        );
+        ++ekf_valid_frame_count;
+        const bool decimating = cfg.ekf_update_stride > 1;
+        const bool apply = !decimating || (ekf_valid_frame_count % cfg.ekf_update_stride == 0);
+        if (apply) {
+            target_state.x = esekf->update_multi(obs);
+            target_state.timestamp = timestamp;
+            last_update = timestamp;
+            this_id = GLOBAL_ID++;
+            voter.update(
+                utils::matrix2rpy(
+                    utils::so3_exp(Vec3(
+                        target_state.x[idx::C_ROT_X],
+                        target_state.x[idx::C_ROT_Y],
+                        target_state.x[idx::C_ROT_Z]
+                    )),
+                    utils::RPYOrder::ZYX
+                )[2],
+                timestamp
+            );
+        }
+        last_ekf_applied = apply;
     }
     update_count += obs.size();
     return obs.size();

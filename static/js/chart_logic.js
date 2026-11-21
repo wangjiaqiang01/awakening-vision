@@ -3,8 +3,8 @@ const CHART_RENDER_INTERVAL_MS = 33;
 const DEFAULT_MAX_POINTS = 100;
 
 const chartMap = {
-  yaw: { label: "Yaw", color: "#2fc3a2" },
-  pitch: { label: "Pitch", color: "#f4b44d" },
+  yaw: { label: "Cmd Yaw", color: "#2fc3a2" },
+  pitch: { label: "Cmd Pitch", color: "#f4b44d" },
   target_yaw: { label: "Target Yaw", color: "#7aa2ff" },
   target_pitch: { label: "Target Pitch", color: "#ef6b73" },
   gimbal_yaw: { label: "Gimbal Yaw", color: "#b18cff" },

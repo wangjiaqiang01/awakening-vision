@@ -8,7 +8,7 @@
     <link rel="preload" href="{{ url_for('static', filename='css/style.css', v='20260705a') }}" as="style" />
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css', v='20260705a') }}" />
     <script defer src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script defer src="{{ url_for('static', filename='js/chart_logic.js', v='20261109a') }}"></script>
+    <script defer src="{{ url_for('static', filename='js/chart_logic.js', v='20261121a') }}"></script>
     <script defer src="{{ url_for('static', filename='js/json_view.js', v='20260609d') }}"></script>
     <script defer src="{{ url_for('static', filename='js/main.js', v='20260705a') }}"></script>
   </head>
@@ -58,8 +58,8 @@
 
           <div class="chart-toolbar">
             <div class="chart-select-controls" id="chartSelectControls">
-              <label><input type="checkbox" data-key="yaw" checked /> Yaw</label>
-              <label><input type="checkbox" data-key="pitch" checked /> Pitch</label>
+              <label><input type="checkbox" data-key="yaw" checked /> Cmd Yaw</label>
+              <label><input type="checkbox" data-key="pitch" checked /> Cmd Pitch</label>
               <label><input type="checkbox" data-key="target_yaw" /> Target Yaw</label>
               <label><input type="checkbox" data-key="target_pitch" /> Target Pitch</label>
               <label><input type="checkbox" data-key="gimbal_yaw" checked /> Gimbal Yaw</label>

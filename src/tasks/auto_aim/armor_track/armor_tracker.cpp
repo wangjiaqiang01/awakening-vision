@@ -12,6 +12,7 @@ namespace awakening::auto_aim {
 struct ArmorTracker::Impl {
     Impl(const YAML::Node& config) {
         cfg_.load(config);
+        AWAKENING_INFO("armor_tracker: ekf_update_stride={} (1=off)", cfg_.ekf_update_stride);
     }
     ArmorTarget track(
         Armors& armors,
@@ -29,7 +30,7 @@ struct ArmorTracker::Impl {
                 found = init_target(t, armors, frame_id, camera_info, camera_cv_in_odom);
             } else {
                 found = update_target(t, armors, camera_info, camera_cv_in_odom);
-                if (found) {
+                if (t.last_ekf_applied) {
                     ekf_updated_this_frame = true;
                 }
             }

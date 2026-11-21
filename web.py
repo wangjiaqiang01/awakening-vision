@@ -257,6 +257,26 @@ def mjpeg_stream():
         )
 
 
+def add_command_data(data):
+    """把最近一次 cmd.yaw/pitch 合并进 /log，便于和 target/gimbal 对照。"""
+    if not isinstance(data, dict):
+        return data
+    try:
+        series = read_json_cached(data_path)
+    except Exception:
+        return data
+    def last_value(key):
+        value = series.get(key)
+        if isinstance(value, list) and value:
+            return value[-1]
+        return None
+    data["gimbal_cmd"] = {
+        "yaw": last_value("yaw"),
+        "pitch": last_value("pitch"),
+    }
+    return data
+
+
 def add_target_distance(data):
     """在 /log 返回的 armor_target 下补充目标距离（odom 原点）。"""
     if not isinstance(data, dict):
@@ -313,6 +333,7 @@ def get_log():
     try:
         data = read_json_cached(log_path)
         add_target_distance(data)
+        add_command_data(data)
         return no_store_json(data)
     except Exception as e:
         return no_store_json({"error": str(e)}, 500)

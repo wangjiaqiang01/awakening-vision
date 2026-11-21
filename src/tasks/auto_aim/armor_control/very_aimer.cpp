@@ -163,20 +163,6 @@ struct VeryAimer::Impl {
     ) const noexcept {
         dta_utils::ControlPoint cp;
         auto p = armor_pose.translation() - shoot_in_gimbal_odom.translation();
-        const double control_distance = p.head<2>().norm();
-        // PnP 偶尔把装甲板解到枪口前 0.1~0.3 m，弹道和云台都会拿到一个
-        // 物理上不可能的控制点；这类点必须拒绝，否则云台会卡住或突然大跳。
-        if (control_distance < 0.30 || p.x() <= 0.05) {
-            cp.valid = false;
-            AWAKENING_WARN(
-                "very_aimer: get_control_point: rejected invalid aim point: [{}, {}, {}], distance: {}",
-                p.x(),
-                p.y(),
-                p.z(),
-                control_distance
-            );
-            return cp;
-        }
         auto desired_pitch_opt = ballistic_trajectory_->solve_pitch(p, bullet_speed);
         if (!desired_pitch_opt) {
             cp.valid = false;

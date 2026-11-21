@@ -14,6 +14,8 @@ namespace awakening::auto_aim {
 
 struct ArmorTrackerCfg {
     int esekf_iter_num;
+    // 选帧开关：1=关闭；N>1 时，每 N 个"本可进入 EKF 的有效观测帧"只真正更新 1 次。
+    int ekf_update_stride = 1;
     double lost_time_thres;
     double lost_time_thres_outpost;
     int tracking_thres;
@@ -40,6 +42,12 @@ struct ArmorTrackerCfg {
     double light_match_pos_gate_by_length_ratio;
     void load(const YAML::Node& config) {
         esekf_iter_num = config["esekf_iter_num"].as<int>();
+        if (config["ekf_update_stride"]) {
+            ekf_update_stride = config["ekf_update_stride"].as<int>();
+        }
+        if (ekf_update_stride < 1) {
+            ekf_update_stride = 1;
+        }
         lost_time_thres = config["lost_time_thres"].as<double>();
         lost_time_thres_outpost = config["lost_time_thres_outpost"].as<double>();
         tracking_thres = config["tracking_thres"].as<int>();
@@ -187,6 +195,10 @@ public:
     ArmorClass target_number = ArmorClass::UNKNOWN;
     int this_id = -1;
     int update_count = 0;
+    // 本 target 已累计的"可进入 EKF"的观测帧数，用于 stride 选帧。
+    int ekf_valid_frame_count = 0;
+    // 本帧的观测是否真正进了 EKF（stride>1 时非每个有效帧都会进）。
+    bool last_ekf_applied = false;
     [[nodiscard]] inline ArmorTarget fast_copy_without_ekf() const noexcept {
         ArmorTarget target;
         target.target_number = this->target_number;

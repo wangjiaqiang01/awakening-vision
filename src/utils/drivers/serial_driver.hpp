@@ -131,6 +131,10 @@ public:
         std::lock_guard<std::mutex> lock(telemetry_mutex_);
         return latest_gimbal_angles_;
     }
+    std::optional<TelemetryStream::Clock::time_point> latest_gimbal_rx_time() const {
+        std::lock_guard<std::mutex> lock(telemetry_mutex_);
+        return latest_gimbal_rx_time_;
+    }
     // 可选的逐帧 trace 回调；必须在 start() 之前设置，回调在串口 IO 线程执行，
     // 内部应尽量短（SerialTrace 只做内存组装和带缓冲的文件写入）。
     using TelemetryTraceCallback = std::function<void(
@@ -295,6 +299,7 @@ private:
         if (valid) {
             std::lock_guard<std::mutex> lock(telemetry_mutex_);
             latest_gimbal_angles_ = std::make_pair(state.yaw, state.pitch);
+            latest_gimbal_rx_time_ = now;
         }
         if (valid && publish_) {
             std::vector<uint8_t> frame;
@@ -354,6 +359,7 @@ private:
     std::deque<std::vector<uint8_t>> write_queue_;
     std::vector<uint8_t> latest_command_, timeout_command_;
     std::optional<std::pair<float, float>> latest_gimbal_angles_;
+    std::optional<TelemetryStream::Clock::time_point> latest_gimbal_rx_time_;
     TelemetryTraceCallback telemetry_trace_;
     CommandTraceCallback command_trace_;
     static constexpr size_t kMaxQueuedFrames = 8;

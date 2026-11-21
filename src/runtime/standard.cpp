@@ -12,6 +12,7 @@
 #include "utils/drivers/camera_factory.hpp"
 #include "utils/io/video_save.hpp"
 #include "utils/io/serial_trace.hpp"
+#include "utils/io/timing_csv.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -339,6 +340,42 @@ int main(int argc, char** argv) {
     // 哨兵（IMU 安装 .Pitch = 0）实机验证为 -1；IMU 倒装的车（如六轮步兵 .Pitch = 180）需要 +1。
     // 首次上车先小角度点动：云台往反方向走就说明这一项要取反（改 config/dong.yaml，无需重编译）。
     const double pitch_sign = config["serial"]["pitch_sign"].as<double>(-1.0);
+    // ---- debug timing CSV: 运行中实时落盘，不改变控制路径 ----
+    const bool debug_timing_enable =
+        config["debug_timing"] && config["debug_timing"]["enable"].as<bool>(false);
+    const int debug_timing_every_n = std::max(
+        1,
+        config["debug_timing"] && config["debug_timing"]["every_n"]
+            ? config["debug_timing"]["every_n"].as<int>(10)
+            : 10
+    );
+    std::unique_ptr<utils::TimingCsvLogger> timing_logger;
+    if (debug_timing_enable) {
+        std::string timing_path = config["debug_timing"] && config["debug_timing"]["path"]
+            ? config["debug_timing"]["path"].as<std::string>()
+            : "log/timing.csv";
+        if (!timing_path.empty() && timing_path.front() != '/') {
+            timing_path = std::string(ROOT_DIR) + "/" + timing_path;
+        }
+        timing_logger = std::make_unique<utils::TimingCsvLogger>(timing_path);
+        if (timing_logger->is_open()) {
+            AWAKENING_INFO(
+                "timing csv: {} every_n={}", timing_logger->path(), debug_timing_every_n
+            );
+        } else {
+            AWAKENING_WARN("timing csv open failed: {}", timing_path);
+            timing_logger.reset();
+        }
+    }
+    const double camera_fps = camera_config["hik_camera"]
+        && camera_config["hik_camera"]["acquisition_frame_rate"]
+        ? camera_config["hik_camera"]["acquisition_frame_rate"].as<double>(-1.0)
+        : -1.0;
+    const double camera_exposure_cfg_us = camera_config["hik_camera"]
+        && camera_config["hik_camera"]["exposure_time"]
+        ? camera_config["hik_camera"]["exposure_time"].as<double>(-1.0)
+        : -1.0;
+
     if (serial) {
         AWAKENING_INFO("serial pitch_sign = {} (按实车云台方向在 config/dong.yaml 调整)", pitch_sign);
         if (telemetry_gimbal_id <= 0 || telemetry_shoot_id <= 0) {
@@ -803,6 +840,137 @@ int main(int argc, char** argv) {
                 rune_aimer.aim(r_target, bullet_speed, shoot_in_gimbal_odom, gimbal_in_gimbal_odom);
             // 与 sentry 一致：打符用 tick_fire 限频，避免每毫秒都请求一次开火。
             cmd.fire_advice = rune_aimer.tick_fire(r_target, cmd);
+        }
+
+
+        if (timing_logger) {
+            static int timing_tick = 0;
+            if (++timing_tick >= debug_timing_every_n) {
+                timing_tick = 0;
+                utils::TimingCsvSample sample;
+                sample.wall_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::system_clock::now().time_since_epoch()
+                                      ).count();
+                const auto to_ns = [](const TimePoint& t) {
+                    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               t.time_since_epoch()
+                           ).count();
+                };
+                const auto t_img = a_target.last_update;
+                const auto t_state = a_target.get_target_state().timestamp;
+                const auto t_cmd =
+                    (cmd.timestamp.time_since_epoch().count() != 0) ? cmd.timestamp : Clock::now();
+                sample.t_img_ns = to_ns(t_img);
+                sample.t_cmd_ns = to_ns(t_cmd);
+                sample.target_state_ts_ns = to_ns(t_state);
+                if (t_img.time_since_epoch().count() != 0) {
+                    sample.dt_img_cmd_ms =
+                        std::chrono::duration<double, std::milli>(t_cmd - t_img).count();
+                }
+                if (t_state.time_since_epoch().count() != 0) {
+                    sample.dt_state_cmd_ms =
+                        std::chrono::duration<double, std::milli>(t_cmd - t_state).count();
+                }
+                if (dbg) {
+                    const auto frame_ts = dbg->img_frame.get().timestamp;
+                    sample.frame_ts_ns = to_ns(frame_ts);
+                    if (frame_ts.time_since_epoch().count() != 0) {
+                        sample.frame_dt_cmd_ms =
+                            std::chrono::duration<double, std::milli>(t_cmd - frame_ts).count();
+                        if (t_img.time_since_epoch().count() != 0) {
+                            sample.target_frame_age_ms =
+                                std::chrono::duration<double, std::milli>(frame_ts - t_img).count();
+                        }
+                    }
+                }
+
+                const auto rpy_cmd = utils::matrix2rpy<double>(
+                    gimbal_in_gimbal_odom.linear(), utils::RPYOrder::ZYX
+                );
+                sample.gimbal_yaw_cmd_deg = angles::to_degrees(rpy_cmd[2]);
+                sample.gimbal_pitch_cmd_deg = -angles::to_degrees(rpy_cmd[1]);
+                if (t_img.time_since_epoch().count() != 0) {
+                    try {
+                        const auto gimbal_at_img = tf->pose_a_in_b(
+                            SimpleFrame::GIMBAL, SimpleFrame::GIMBAL_ODOM, t_img
+                        );
+                        const auto rpy_img = utils::matrix2rpy<double>(
+                            gimbal_at_img.linear(), utils::RPYOrder::ZYX
+                        );
+                        sample.gimbal_yaw_img_deg = angles::to_degrees(rpy_img[2]);
+                        sample.gimbal_pitch_img_deg = -angles::to_degrees(rpy_img[1]);
+                        sample.tf_img_valid = 1;
+                    } catch (...) {
+                        sample.tf_img_valid = 0;
+                    }
+                }
+
+                if (serial) {
+                    if (const auto angles = serial->latest_gimbal_angles()) {
+                        sample.telemetry_yaw_deg = angles->first;
+                        sample.telemetry_pitch_deg = angles->second;
+                        sample.telemetry_valid = 1;
+                    }
+                    if (const auto rx = serial->latest_gimbal_rx_time()) {
+                        sample.telemetry_age_ms =
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - *rx
+                            ).count();
+                    }
+                }
+
+                sample.cmd_yaw_deg = cmd.yaw;
+                sample.cmd_pitch_deg = cmd.pitch;
+                sample.target_yaw_deg = cmd.target_yaw;
+                sample.target_pitch_deg = cmd.target_pitch;
+                sample.err_cmd_target_yaw_deg =
+                    angles::shortest_angular_distance_degrees(cmd.yaw, cmd.target_yaw);
+                sample.err_cmd_gimbal_yaw_deg =
+                    angles::shortest_angular_distance_degrees(cmd.yaw, sample.gimbal_yaw_cmd_deg);
+                sample.err_target_gimbal_yaw_deg = angles::shortest_angular_distance_degrees(
+                    cmd.target_yaw, sample.gimbal_yaw_cmd_deg
+                );
+                sample.err_cmd_target_pitch_deg =
+                    angles::shortest_angular_distance_degrees(cmd.pitch, cmd.target_pitch);
+                sample.err_cmd_gimbal_pitch_deg =
+                    angles::shortest_angular_distance_degrees(cmd.pitch, sample.gimbal_pitch_cmd_deg);
+                sample.err_target_gimbal_pitch_deg = angles::shortest_angular_distance_degrees(
+                    cmd.target_pitch, sample.gimbal_pitch_cmd_deg
+                );
+                sample.cmd_v_yaw = cmd.v_yaw;
+                sample.cmd_a_yaw = cmd.a_yaw;
+                sample.cmd_v_pitch = cmd.v_pitch;
+                sample.cmd_a_pitch = cmd.a_pitch;
+
+                sample.select_id = cmd.select_id;
+                sample.target_number = static_cast<int>(a_target.target_number);
+                sample.this_id = a_target.this_id;
+                sample.match_count = a_target.last_match_count;
+                sample.frame_id = a_target.get_target_state().frame_id;
+                sample.fsm = static_cast<int>(auto_aim_fsm_controller.get_state());
+                sample.track_state =
+                    static_cast<int>(a_target.track_state.tracker_state);
+                sample.target_valid = a_target.check() ? 1 : 0;
+                sample.cmd_appear = cmd.appear ? 1 : 0;
+                sample.cmd_valid = cmd.is_valid() ? 1 : 0;
+                sample.fire = cmd.fire_advice ? 1 : 0;
+
+                if (cmd.appear && cmd.is_valid()) {
+                    sample.distance_m =
+                        (cmd.aim_point.pose.translation() - shoot_in_gimbal_odom.translation()).norm();
+                    sample.fly_time_s = cmd.fly_time;
+                }
+                sample.exposure_us = camera_exposure_cfg_us;
+                if (camera) {
+                    const double actual = camera->get_ExposureTime();
+                    if (actual > 0.0) sample.exposure_us = actual;
+                }
+                sample.camera_fps = camera_fps;
+                sample.bullet_speed = bullet_speed;
+                sample.serial_send_to_image_us = serial_send_to_image_microseconds;
+                sample.mode = static_cast<int>(mode.load());
+                timing_logger->write(sample);
+            }
         }
 
         if (serial) {
