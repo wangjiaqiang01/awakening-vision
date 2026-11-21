@@ -134,6 +134,17 @@ public:
         return T;
     }
 
+    // 仅查询直接边；用于诊断 TF 最新样本年龄。
+    std::optional<TimePoint> latest_stamp(FrameEnum parent, FrameEnum child) const {
+        if (!valid_frame(parent) || !valid_frame(child))
+            return std::nullopt;
+        if (has_direct_edge(parent, child))
+            return buffers_[to_index(parent)][to_index(child)].buffer.latest_stamp();
+        if (has_direct_edge(child, parent))
+            return buffers_[to_index(child)][to_index(parent)].buffer.latest_stamp();
+        return std::nullopt;
+    }
+
     std::vector<Edge<FrameEnum>> get_edges() const {
         return edges_;
     }

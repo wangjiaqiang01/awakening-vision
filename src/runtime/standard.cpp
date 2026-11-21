@@ -884,11 +884,8 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                const auto rpy_cmd = utils::matrix2rpy<double>(
-                    gimbal_in_gimbal_odom.linear(), utils::RPYOrder::ZYX
-                );
-                sample.gimbal_yaw_cmd_deg = angles::to_degrees(rpy_cmd[2]);
-                sample.gimbal_pitch_cmd_deg = -angles::to_degrees(rpy_cmd[1]);
+                // timing 的 gimbal_yaw_cmd / gimbal_pitch_cmd 不再使用 tf(now)；
+                // 改为下面 serial 的最新 telemetry 姿态，避免 TimePoseBuffer 外推伪迹。
                 if (t_img.time_since_epoch().count() != 0) {
                     try {
                         const auto gimbal_at_img = tf->pose_a_in_b(
@@ -909,6 +906,9 @@ int main(int argc, char** argv) {
                     if (const auto angles = serial->latest_gimbal_angles()) {
                         sample.telemetry_yaw_deg = angles->first;
                         sample.telemetry_pitch_deg = angles->second;
+                        // 用同一帧最新 telemetry 姿态填充 timing 的 cmd 列。
+                        sample.gimbal_yaw_cmd_deg = angles->first;
+                        sample.gimbal_pitch_cmd_deg = angles->second;
                         sample.telemetry_valid = 1;
                     }
                     if (const auto rx = serial->latest_gimbal_rx_time()) {
@@ -916,6 +916,15 @@ int main(int argc, char** argv) {
                             std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - *rx
                             ).count();
+                    }
+                }
+
+                if (tf) {
+                    if (const auto tf_stamp = tf->latest_stamp(
+                            SimpleFrame::GIMBAL_ODOM, SimpleFrame::GIMBAL
+                        )) {
+                        sample.tf_age_ms =
+                            std::chrono::duration<double, std::milli>(t_cmd - *tf_stamp).count();
                     }
                 }
 

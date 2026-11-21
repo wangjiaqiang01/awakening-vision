@@ -4,6 +4,7 @@
 #include <cmath>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 
 namespace awakening::utils {
@@ -75,6 +76,13 @@ public:
         T.linear() = q.toRotationMatrix();
         T.translation() = trans;
         return T;
+    }
+
+    std::optional<TimePoint> latest_stamp() const {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        if (buffer_.empty())
+            return std::nullopt;
+        return buffer_.back().stamp;
     }
 
 private:

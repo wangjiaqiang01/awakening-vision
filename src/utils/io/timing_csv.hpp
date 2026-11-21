@@ -21,6 +21,7 @@ struct TimingCsvSample {
     double frame_dt_cmd_ms = -1.0;
     double target_frame_age_ms = -1.0;
     double telemetry_age_ms = -1.0;
+    double tf_age_ms = -1.0;
 
     double gimbal_yaw_img_deg = std::numeric_limits<double>::quiet_NaN();
     double gimbal_yaw_cmd_deg = std::numeric_limits<double>::quiet_NaN();
@@ -106,6 +107,7 @@ public:
              << s.frame_dt_cmd_ms << ','
              << s.target_frame_age_ms << ','
              << s.telemetry_age_ms << ','
+             << s.tf_age_ms << ','
              << s.gimbal_yaw_img_deg << ','
              << s.gimbal_yaw_cmd_deg << ','
              << s.gimbal_pitch_img_deg << ','
@@ -156,7 +158,7 @@ public:
 private:
     void write_header() {
         out_ << "wall_time_us,t_img_ns,t_cmd_ns,target_state_ts_ns,frame_ts_ns,"
-             << "dt_img_cmd_ms,dt_state_cmd_ms,frame_dt_cmd_ms,target_frame_age_ms,telemetry_age_ms,"
+             << "dt_img_cmd_ms,dt_state_cmd_ms,frame_dt_cmd_ms,target_frame_age_ms,telemetry_age_ms,tf_age_ms,"
              << "gimbal_yaw_img_deg,gimbal_yaw_cmd_deg,gimbal_pitch_img_deg,gimbal_pitch_cmd_deg,"
              << "telemetry_yaw_deg,telemetry_pitch_deg,"
              << "cmd_yaw_deg,cmd_pitch_deg,target_yaw_deg,target_pitch_deg,"
