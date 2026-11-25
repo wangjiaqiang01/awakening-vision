@@ -6,6 +6,7 @@
 #include <boost/asio.hpp>
 #include <yaml-cpp/yaml.h>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -149,6 +150,18 @@ public:
         telemetry_trace_ = std::move(telemetry_callback);
         command_trace_ = std::move(command_callback);
     }
+    // 可选的串口 IO 线程直通回调（必须在 start() 之前设置）：
+    // 在 async_read_some 返回后按单次读取批次回调最新有效帧及准确的接收时刻，
+    // 避免同济 IMU 帧经过 Scheduler 的并发 TBB 队列后出现乱序与时间戳抖动。
+    // 注册后同济协议不再经由 runtime_push_source 重复投递到业务侧。
+    using TelemetryRxCallback = std::function<void(
+        const TongjiTelemetry&,
+        std::chrono::system_clock::time_point,
+        std::size_t
+    )>;
+    void set_telemetry_callback(TelemetryRxCallback callback) {
+        telemetry_callback_ = std::move(callback);
+    }
 private:
     // 只有配置了同济状态回传 ID 才启用严格组帧解析；未配置的用途
     // （例如 radar_detect 的裁判/图传串口）按纯字节流处理，不做帧同步判定。
@@ -270,6 +283,7 @@ private:
                     return;
                 }
                 const auto now = TelemetryStream::Clock::now();
+                const auto wall_now = std::chrono::system_clock::now();
                 if (size) {
                     last_rx_ = now;
                     // 非同济协议保持原始字节透传；同济状态在 observe 中按完整有效帧投递。
@@ -278,18 +292,32 @@ private:
                         publish_(std::vector<uint8_t>(read_buf_.data(), read_buf_.data() + size));
                     }
                 }
+                std::optional<TongjiTelemetry> batch_latest;
+                std::size_t batch_valid_frames = 0;
                 if (telemetry_enabled() && !stream_.feed(read_buf_.data(), size, now,
-                    [this, now](const uint8_t* p, size_t n) { observe(p, n, now); })) {
+                    [this, now, &batch_latest, &batch_valid_frames](const uint8_t* p, size_t n) {
+                        if (auto decoded = observe(p, n, now)) {
+                            batch_latest = *decoded;
+                            ++batch_valid_frames;
+                        }
+                    })) {
                     if (stream_.expired(now)) ++timeouts_;
                     else ++framing_errors_;
                     AWAKENING_WARN("Telemetry framing failed; reconnecting without guessing a sync position");
                     end_connection();
                     return;
                 }
+                if (batch_latest && telemetry_callback_) {
+                    telemetry_callback_(*batch_latest, wall_now, batch_valid_frames);
+                }
                 read();
             });
     }
-    void observe(const uint8_t* p, size_t n, TelemetryStream::Clock::time_point now) {
+    std::optional<TongjiTelemetry> observe(
+        const uint8_t* p,
+        size_t n,
+        TelemetryStream::Clock::time_point now
+    ) {
         ++frames_;
         TongjiTelemetry state{};
         const bool valid = TongjiTelemetry::decode(p, n, active_.telemetry_gimbal_id,
@@ -301,7 +329,7 @@ private:
             latest_gimbal_angles_ = std::make_pair(state.yaw, state.pitch);
             latest_gimbal_rx_time_ = now;
         }
-        if (valid && publish_) {
+        if (valid && publish_ && !telemetry_callback_) {
             std::vector<uint8_t> frame;
             frame.reserve(n + 2);
             frame.push_back(static_cast<uint8_t>(n & 0xff));
@@ -309,13 +337,16 @@ private:
             frame.insert(frame.end(), p, p + n);
             publish_(std::move(frame));
         }
-        if (now - last_log_ < std::chrono::seconds(1)) return;
-        last_log_ = now;
-        if (valid)
-            AWAKENING_INFO("Telemetry RX: yaw_deg={} pitch_deg={} roll_deg={} mode_raw={} robot_id={} bullet_speed={}",
-                           state.yaw, state.pitch, state.roll, state.mode, state.robot_id, state.bullet_speed);
-        else
-            AWAKENING_WARN("Telemetry unparsed/rejected: check configured IDs, layout and values; no CRC exists in this protocol");
+        if (now - last_log_ >= std::chrono::seconds(1)) {
+            last_log_ = now;
+            if (valid)
+                AWAKENING_INFO("Telemetry RX: yaw_deg={} pitch_deg={} roll_deg={} mode_raw={} robot_id={} bullet_speed={}",
+                               state.yaw, state.pitch, state.roll, state.mode, state.robot_id, state.bullet_speed);
+            else
+                AWAKENING_WARN("Telemetry unparsed/rejected: check configured IDs, layout and values; no CRC exists in this protocol");
+        }
+        if (!valid) return std::nullopt;
+        return state;
     }
     void run() {
         while (!stop_requested_) {
@@ -362,6 +393,7 @@ private:
     std::optional<TelemetryStream::Clock::time_point> latest_gimbal_rx_time_;
     TelemetryTraceCallback telemetry_trace_;
     CommandTraceCallback command_trace_;
+    TelemetryRxCallback telemetry_callback_;
     static constexpr size_t kMaxQueuedFrames = 8;
     std::atomic<uint64_t> generation_{0};
     std::atomic<bool> connected_{false};

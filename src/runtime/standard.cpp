@@ -45,6 +45,7 @@
 #endif
 #include "param_deliver.h"
 #include "runtime/config.hpp"
+#include "runtime/frame_plan_loop.hpp"
 #include "tasks/auto_aim/armor_control/very_aimer.hpp"
 #include "tasks/auto_aim/armor_detect/armor_detector.hpp"
 #include "tasks/auto_aim/armor_track/armor_target.hpp"
@@ -335,7 +336,6 @@ int main(int argc, char** argv) {
     // 同济状态回传的消息 ID，必须与下位机 InitParam() 的注册一致（见 config/dong.yaml）。
     const int telemetry_gimbal_id = config["serial"]["telemetry_gimbal_id"].as<int>(-1);
     const int telemetry_shoot_id = config["serial"]["telemetry_shoot_id"].as<int>(-1);
-    const int telemetry_frame_timeout_ms = config["serial"]["frame_timeout_ms"].as<int>(1000);
     // 视觉 pitch（抬头为正）到固件 IMU Pitch 的符号，只在发送边界使用。
     // 哨兵（IMU 安装 .Pitch = 0）实机验证为 -1；IMU 倒装的车（如六轮步兵 .Pitch = 180）需要 +1。
     // 首次上车先小角度点动：云台往反方向走就说明这一项要取反（改 config/dong.yaml，无需重编译）。
@@ -491,67 +491,49 @@ int main(int argc, char** argv) {
         return std::make_tuple(std::optional<CommonFrameIo::second_type>(std::move(frame)));
     });
 
-    if (serial) {
-        s.register_task<SerialIO>("receive_serial", [&](SerialIO::second_type&& data) {
-            // 未配置回传 ID 的配置（omni/leg/uav/wit/eg 目前就是）不做同济组帧：
-            // 旧协议已不再解析，这里直接丢弃输入，只保留发送侧，避免每包刷一次告警。
-            if (telemetry_gimbal_id <= 0 || telemetry_shoot_id <= 0) return;
-            static std::mutex mutex;
-            // 下位机约 1kHz 连续发送 30 字节定长帧（int16 长度 + [int16 ID][payload]）：
-            //   ID 1 -> {float yaw, float pitch, float roll, int32 mode, int32 robot_id}（角度单位「度」）
-            //   ID 2 -> {float bullet_speed}
-            // 驱动只投递完整有效帧，这里保留一层组帧解析以便与 sentry 写法一致。
-            static TelemetryStream stream{std::chrono::milliseconds(telemetry_frame_timeout_ms)};
-            std::lock_guard<std::mutex> lock(mutex);
-
-            const auto packet_time =
-                Clock::now() - std::chrono::microseconds(serial_send_to_image_microseconds);
-            const bool ok = stream.feed(
-                data.data(),
-                data.size(),
-                TelemetryStream::Clock::now(),
-                [&](const uint8_t* p, size_t n) {
-                    TongjiTelemetry state {};
-                    if (!TongjiTelemetry::decode(
-                            p,
-                            n,
-                            telemetry_gimbal_id,
-                            telemetry_shoot_id,
-                            state
-                        ))
-                    {
-                        return;
-                    }
-                    log_ctx.serial_count++;
-                    // 云台姿态反馈 GIMBAL_ODOM -> GIMBAL：自瞄解算的输入基准，必须持续更新，
-                    // 否则 very_aimer 拿到的云台位姿会退化成单位变换。
-                    ISO3 gimbal_in_gimbal_odom = ISO3::Identity();
-                    gimbal_in_gimbal_odom.linear() = utils::rpy2matrix(
-                        Vec3(
-                            angles::from_degrees(state.roll),
-                            angles::from_degrees(state.pitch),
-                            angles::from_degrees(state.yaw)
-                        ),
-                        utils::RPYOrder::ZYX
-                    );
-                    tf->push(
-                        SimpleFrame::GIMBAL_ODOM,
-                        SimpleFrame::GIMBAL,
-                        packet_time,
-                        gimbal_in_gimbal_odom
-                    );
-                    // 说明：该版本固件的状态回传里没有 operator_*_offset、v_x/v_y/v_z、
-                    // bullet_count，也没有旧业务包里的三个时间戳，因此：
-                    //   operator_offset 保持 {0,0}（需要补偿时在 config 或网页侧调整）；
-                    //   enemy_color / bullet_speed 继续由 config/dong.yaml 决定，不被回传值覆盖；
-                    //   BulletPickUp 的弹道事件暂不可用（缺少已发弹计数）。
-                }
-            );
-            if (!ok) {
-                // 粘包错位或半帧超时：主动复位解析器，避免它永久停留在 failed 状态。
-                AWAKENING_WARN("Serial frame desync; resetting telemetry stream parser");
-                stream.reset();
+    const bool direct_telemetry_tf =
+        serial && telemetry_gimbal_id > 0 && telemetry_shoot_id > 0;
+    const auto serial_tf_offset = direct_telemetry_tf
+        ? std::chrono::microseconds(serial_send_to_image_microseconds)
+        : std::chrono::microseconds(0);
+    auto serial_rx_counter = std::make_shared<std::atomic<int>>(0);
+    if (direct_telemetry_tf) {
+        // 直接在 SerialDriver 单 IO 线程入 TF：按单次 USB 读取批次取最新帧并打接收时刻，
+        // 避免经由 Scheduler 16 线程 TBB 队列乱序与微秒级假间隔污染 TimePoseBuffer。
+        serial->set_telemetry_callback(
+            [tf, serial_tf_offset, serial_rx_counter](
+                const TongjiTelemetry& state,
+                std::chrono::system_clock::time_point rx_wall_time,
+                std::size_t batch_frames
+            ) {
+                serial_rx_counter->fetch_add(
+                    static_cast<int>(batch_frames), std::memory_order_relaxed
+                );
+                const auto packet_time = rx_wall_time - serial_tf_offset;
+                ISO3 gimbal_in_gimbal_odom = ISO3::Identity();
+                gimbal_in_gimbal_odom.linear() = utils::rpy2matrix(
+                    Vec3(
+                        angles::from_degrees(state.roll),
+                        angles::from_degrees(state.pitch),
+                        angles::from_degrees(state.yaw)
+                    ),
+                    utils::RPYOrder::ZYX
+                );
+                tf->push(
+                    SimpleFrame::GIMBAL_ODOM,
+                    SimpleFrame::GIMBAL,
+                    packet_time,
+                    gimbal_in_gimbal_odom
+                );
             }
+        );
+    }
+
+    if (serial) {
+        s.register_task<SerialIO>("receive_serial", [direct_telemetry_tf](SerialIO::second_type&&) {
+            // 同济协议已由 SerialDriver IO 线程直通写入 TF；
+            // 未配置回传 ID 的旧配置不再解析旧协议，这里仅保持 Scheduler 拓扑连接。
+            if (direct_telemetry_tf) return;
         });
     }
     if (camera) {
@@ -697,9 +679,16 @@ int main(int argc, char** argv) {
         return std::make_tuple(std::optional<DetIo::second_type>(std::move(r)));
     });
 
-    s.register_task<DetIo>("tracker", [&](DetIo::second_type&& io) {
-        static std::mutex mutex;
-        std::lock_guard<std::mutex> lock(mutex);
+    const bool vision_d_plan_loop = very_aimer.uses_vision_d_mpc();
+    auto plan_signal = std::make_shared<runtime::FramePlanLoop::Signal>();
+    std::mutex solver_mutex;
+    std::function<void()> run_solver_step;
+
+    s.register_task<DetIo>("tracker", [&, plan_signal](DetIo::second_type&& io) {
+        bool updated = false;
+        {
+            static std::mutex mutex;
+            std::lock_guard<std::mutex> lock(mutex);
         if (io.armors) {
             for (const auto& armors_raw: io.armors.value()) {
                 auto armors = armors_raw;
@@ -731,6 +720,7 @@ int main(int argc, char** argv) {
                     __armor_target.get_target_state().timestamp
                 );
                 armor_target.write(__armor_target);
+                updated = true;
                 if (io.detect_start) {
                     auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                           Clock::now() - io.detect_start.value()
@@ -762,6 +752,7 @@ int main(int argc, char** argv) {
                     rune_tracker.track(rune, camera_info, camera_cv_in_odom, rune.frame_id);
 
                 rune_target.write(__rune_target);
+                updated = true;
                 if (io.detect_start) {
                     auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                           Clock::now() - io.detect_start.value()
@@ -778,8 +769,13 @@ int main(int argc, char** argv) {
                 log_ctx.track_count++;
             }
         }
+        }
+        if (vision_d_plan_loop && updated) {
+            plan_signal->notify();
+        }
     });
-    s.add_rate_source<>("solver", 1000.0, [&]() {
+    run_solver_step = [&]() {
+        std::lock_guard<std::mutex> solver_lock(solver_mutex);
         log_ctx.solve_count++;
         auto a_target = armor_target.read(); //需要转为相对gimbal_odom
         int old_this_id = a_target.this_id;
@@ -818,10 +814,11 @@ int main(int argc, char** argv) {
             .appear = false,
         };
         int command_target_key = -1;
+        const auto solver_tf_now = Clock::now() - serial_tf_offset;
         auto shoot_in_gimbal_odom =
-            tf->pose_a_in_b(SimpleFrame::SHOOT, SimpleFrame::GIMBAL_ODOM, Clock::now());
+            tf->pose_a_in_b(SimpleFrame::SHOOT, SimpleFrame::GIMBAL_ODOM, solver_tf_now);
         auto gimbal_in_gimbal_odom =
-            tf->pose_a_in_b(SimpleFrame::GIMBAL, SimpleFrame::GIMBAL_ODOM, Clock::now());
+            tf->pose_a_in_b(SimpleFrame::GIMBAL, SimpleFrame::GIMBAL_ODOM, solver_tf_now);
         if (a_target.check()) {
             command_target_key = std::to_underlying(a_target.target_number);
             very_aimer.set_operator_offset(operator_offset);
@@ -884,8 +881,11 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                // timing 的 gimbal_yaw_cmd / gimbal_pitch_cmd 不再使用 tf(now)；
-                // 改为下面 serial 的最新 telemetry 姿态，避免 TimePoseBuffer 外推伪迹。
+                const auto rpy_cmd = utils::matrix2rpy<double>(
+                    gimbal_in_gimbal_odom.linear(), utils::RPYOrder::ZYX
+                );
+                sample.gimbal_yaw_cmd_deg = angles::to_degrees(rpy_cmd[2]);
+                sample.gimbal_pitch_cmd_deg = -angles::to_degrees(rpy_cmd[1]);
                 if (t_img.time_since_epoch().count() != 0) {
                     try {
                         const auto gimbal_at_img = tf->pose_a_in_b(
@@ -904,11 +904,9 @@ int main(int argc, char** argv) {
 
                 if (serial) {
                     if (const auto angles = serial->latest_gimbal_angles()) {
+                        sample.gimbal_yaw_deg = angles->first;
                         sample.telemetry_yaw_deg = angles->first;
                         sample.telemetry_pitch_deg = angles->second;
-                        // 用同一帧最新 telemetry 姿态填充 timing 的 cmd 列。
-                        sample.gimbal_yaw_cmd_deg = angles->first;
-                        sample.gimbal_pitch_cmd_deg = angles->second;
                         sample.telemetry_valid = 1;
                     }
                     if (const auto rx = serial->latest_gimbal_rx_time()) {
@@ -923,8 +921,9 @@ int main(int argc, char** argv) {
                     if (const auto tf_stamp = tf->latest_stamp(
                             SimpleFrame::GIMBAL_ODOM, SimpleFrame::GIMBAL
                         )) {
-                        sample.tf_age_ms =
-                            std::chrono::duration<double, std::milli>(t_cmd - *tf_stamp).count();
+                        sample.tf_age_ms = std::chrono::duration<double, std::milli>(
+                            (t_cmd - serial_tf_offset) - *tf_stamp
+                        ).count();
                     }
                 }
 
@@ -932,6 +931,17 @@ int main(int argc, char** argv) {
                 sample.cmd_pitch_deg = cmd.pitch;
                 sample.target_yaw_deg = cmd.target_yaw;
                 sample.target_pitch_deg = cmd.target_pitch;
+                if (a_target.check()) {
+                    const auto& target_state = a_target.get_target_state();
+                    const auto target_pos = target_state.pos();
+                    sample.target_bearing_deg =
+                        angles::to_degrees(std::atan2(target_pos.y(), target_pos.x()));
+                    const auto target_from_shoot =
+                        target_pos - shoot_in_gimbal_odom.translation();
+                    sample.shoot_bearing_deg = angles::to_degrees(
+                        std::atan2(target_from_shoot.y(), target_from_shoot.x())
+                    );
+                }
                 sample.err_cmd_target_yaw_deg =
                     angles::shortest_angular_distance_degrees(cmd.yaw, cmd.target_yaw);
                 sample.err_cmd_gimbal_yaw_deg =
@@ -955,6 +965,49 @@ int main(int argc, char** argv) {
                 sample.target_number = static_cast<int>(a_target.target_number);
                 sample.this_id = a_target.this_id;
                 sample.match_count = a_target.last_match_count;
+                sample.aim_id = cmd.select_id;
+                sample.aimer_type = [] (const YAML::Node& cfg) {
+                    return cfg["very_aimer"] && cfg["very_aimer"]["type"]
+                        ? cfg["very_aimer"]["type"].as<std::string>()
+                        : std::string("unknown");
+                }(config);
+                {
+                    // 只记录 this_id 变化时的直接原因，避免把同一目标的重复采样算成切换。
+                    static int last_this_id = -1;
+                    static int last_target_number = -1;
+                    const int cur_this_id = a_target.this_id;
+                    const int cur_target_number = static_cast<int>(a_target.target_number);
+                    if (cur_this_id < 0) {
+                        sample.this_id_change_reason = "no_target";
+                    } else if (last_this_id < 0) {
+                        sample.this_id_change_reason = "first_target";
+                    } else if (cur_this_id == last_this_id) {
+                        sample.this_id_change_reason = "same";
+                    } else if (a_target.jumped) {
+                        sample.this_id_change_reason = "jumped";
+                    } else if (cur_target_number != last_target_number) {
+                        sample.this_id_change_reason = "target_number_changed";
+                    } else if (a_target.track_state.tracker_state
+                               == auto_aim::ArmorTarget::TrackState::DETECTING) {
+                        sample.this_id_change_reason = "new_target_detecting";
+                    } else if (a_target.track_state.tracker_state
+                               == auto_aim::ArmorTarget::TrackState::TEMP_LOST) {
+                        sample.this_id_change_reason = "temp_lost_reacquire";
+                    } else {
+                        sample.this_id_change_reason = "new_id";
+                    }
+                    last_this_id = cur_this_id;
+                    last_target_number = cur_target_number;
+                }
+                if (a_target.check()) {
+                    const auto aim_debug = very_aimer.get_debug_info();
+                    sample.this_id_same = aim_debug.this_id_same ? 1 : 0;
+                    sample.fsm_same = aim_debug.fsm_same ? 1 : 0;
+                    sample.bullet_speed_same = aim_debug.bullet_speed_same ? 1 : 0;
+                    sample.shoot_pose_same = aim_debug.shoot_pose_same ? 1 : 0;
+                    sample.gimbal_pose_same = aim_debug.gimbal_pose_same ? 1 : 0;
+                    sample.time_in_traj_s = aim_debug.time_in_traj_s;
+                }
                 sample.frame_id = a_target.get_target_state().frame_id;
                 sample.fsm = static_cast<int>(auto_aim_fsm_controller.get_state());
                 sample.track_state =
@@ -1146,15 +1199,30 @@ int main(int argc, char** argv) {
         auto old_in_camera_cv = tf->pose_a_in_b(
             SimpleFrame(cmd.aim_point.frame_id),
             SimpleFrame::CAMERA_CV,
-            cmd.timestamp
+            cmd.timestamp - serial_tf_offset
         );
         cmd.aim_point.transform(old_in_camera_cv, std::to_underlying(SimpleFrame::CAMERA_CV));
         if (dbg && is_web_running()) {
             dbg->gimbal_cmd.set(cmd);
         }
-    });
+    };
+    runtime::FramePlanLoop plan_loop(plan_signal);
+    if (vision_d_plan_loop) {
+        AWAKENING_INFO(
+            "solver loop: vision_d dedicated frame-driven plan thread (1000 Hz rate source disabled)"
+        );
+    } else {
+        s.add_rate_source<>("solver", 1000.0, [&]() { run_solver_step(); });
+        AWAKENING_INFO(
+            "solver loop: 1000 Hz rate source (type={}, mpc_mode={})",
+            config["very_aimer"]["type"].as<std::string>("unknown"),
+            auto_aim::VeryAimer::mpc_mode_name(very_aimer.mpc_mode())
+        );
+    }
     s.add_rate_source<>("logger", 1.0, [&]() {
         double avg_latency_ms = log_ctx.latency_ms_total / log_ctx.detect_count;
+        const int serial_count =
+            log_ctx.serial_count + serial_rx_counter->exchange(0, std::memory_order_relaxed);
         AWAKENING_INFO(
             "detect: {} track: {} found: {} ekf_frames: {} solve: {} serial: {} camera: {} avg_latency: {:.3} ms",
             log_ctx.detect_count,
@@ -1162,7 +1230,7 @@ int main(int argc, char** argv) {
             log_ctx.found_count,
             log_ctx.ekf_count,
             log_ctx.solve_count,
-            log_ctx.serial_count,
+            serial_count,
             log_ctx.camera_count,
             avg_latency_ms
         );
@@ -1188,8 +1256,9 @@ int main(int argc, char** argv) {
                 dbg->armor_target.set(__armor_target);
                 dbg->rune_target.set(__rune_target);
                 dbg->auto_aim_fsm_state.set(auto_aim_fsm_controller.get_state());
-                auto gimbal_in_gimbal_odom =
-                    tf->pose_a_in_b(SimpleFrame::GIMBAL, SimpleFrame::GIMBAL_ODOM, Clock::now());
+                auto gimbal_in_gimbal_odom = tf->pose_a_in_b(
+                    SimpleFrame::GIMBAL, SimpleFrame::GIMBAL_ODOM, Clock::now() - serial_tf_offset
+                );
                 auto rpy =
                     utils::matrix2rpy<double>(gimbal_in_gimbal_odom.linear(), utils::RPYOrder::ZYX);
                 auto gimbal_yaw_pitch =
@@ -1257,6 +1326,9 @@ int main(int argc, char** argv) {
         serial->start<SerialTag>("serial");
     }
     s.build();
+    if (vision_d_plan_loop) {
+        plan_loop.start(run_solver_step);
+    }
     s.run();
 
 #ifdef USE_ROS2
@@ -1264,6 +1336,10 @@ int main(int argc, char** argv) {
 #endif
     utils::SignalGuard::spin(std::chrono::milliseconds(1000));
     s.stop();
+    plan_loop.stop();
+    if (serial) {
+        serial->stop();
+    }
 #ifdef USE_ROS2
     rcl_node.shutdown();
 #endif

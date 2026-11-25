@@ -1,6 +1,8 @@
 const DATA_POLL_INTERVAL_MS = 100;
 const CHART_RENDER_INTERVAL_MS = 33;
 const DEFAULT_MAX_POINTS = 100;
+const TARGET_XYZ_MAX_POINTS = 200;
+const TARGET_XYZ_POLL_INTERVAL_MS = 100;
 
 const chartMap = {
   yaw: { label: "Cmd Yaw", color: "#2fc3a2" },
@@ -34,6 +36,10 @@ let lastRenderAt = 0;
 let selectedKeys = [];
 let individualCharts = {};
 let individualRanges = {};
+let targetXyzChart = null;
+let targetXyzTimer = null;
+let targetXyzFetchController = null;
+let targetXyzSignature = "";
 
 function chartOptions() {
   return {
@@ -162,6 +168,35 @@ function createChart(canvas, datasets) {
   });
 }
 
+function createTargetXyzChart(container) {
+  const box = document.createElement("section");
+  box.className = "chart-box target-xyz-box";
+
+  const title = document.createElement("h4");
+  title.textContent = "Target XYZ (m)";
+  box.appendChild(title);
+
+  const canvasWrap = document.createElement("div");
+  canvasWrap.className = "chart-canvas-wrap";
+  const canvas = document.createElement("canvas");
+  canvasWrap.appendChild(canvas);
+  box.appendChild(canvasWrap);
+  container.appendChild(box);
+
+  const chart = createChart(canvas, [
+    { label: "Target X", data: [], borderColor: "#4fc3f7", backgroundColor: "#4fc3f7", fill: false },
+    { label: "Target Y", data: [], borderColor: "#81c784", backgroundColor: "#81c784", fill: false },
+    { label: "Target Z", data: [], borderColor: "#ffb74d", backgroundColor: "#ffb74d", fill: false },
+  ]);
+
+  chart.options.scales.x.display = true;
+  chart.options.scales.x.ticks = { color: "#8fa0ad", maxTicksLimit: 4 };
+  chart.options.scales.x.grid = { display: false };
+  chart.options.elements.line.spanGaps = false;
+  targetXyzChart = chart;
+  targetXyzSignature = "";
+}
+
 function initCharts() {
   if (!window.Chart) {
     setStatus("data-status", false);
@@ -191,11 +226,17 @@ function updateCharts() {
   mainChart.data.datasets = showMulti ? selectedKeys.map(createDataset) : [];
   mainChart.update("none");
 
+  if (targetXyzChart) {
+    targetXyzChart.destroy();
+    targetXyzChart = null;
+  }
+
   for (const chart of Object.values(individualCharts)) {
     chart.destroy();
   }
   individualCharts = {};
   container.replaceChildren();
+  createTargetXyzChart(container);
 
   for (const key of selectedKeys) {
     const meta = chartMap[key] || { label: key };
@@ -338,6 +379,57 @@ async function fetchDataAndQueueRender() {
       dataFetchController = null;
     }
   }
+}
+
+async function fetchTargetXyz() {
+  if (!targetXyzChart) return;
+  if (targetXyzFetchController) return;
+
+  const controller = new AbortController();
+  targetXyzFetchController = controller;
+  try {
+    const response = await fetch(`/target_xyz?max_points=${TARGET_XYZ_MAX_POINTS}`, {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(response.statusText);
+
+    const json = await response.json();
+    const labels = Array.isArray(json.time) ? json.time : [];
+    if (labels.length === 0) return;
+
+    const signature = `${labels.length}:${labels[labels.length - 1]}`;
+    if (signature === targetXyzSignature) return;
+    targetXyzSignature = signature;
+
+    targetXyzChart.data.labels = labels;
+    const keys = ["target_x", "target_y", "target_z"];
+    const allValues = [];
+    targetXyzChart.data.datasets.forEach((dataset, index) => {
+      const values = Array.isArray(json[keys[index]]) ? json[keys[index]] : [];
+      dataset.data = values;
+      allValues.push(...values);
+    });
+    setAutoScale(targetXyzChart, allValues);
+    targetXyzChart.update("none");
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      console.warn("target xyz fetch failed:", error.message);
+    }
+  } finally {
+    if (targetXyzFetchController === controller) {
+      targetXyzFetchController = null;
+    }
+  }
+}
+
+function startTargetXyzLoop() {
+  if (targetXyzTimer) return;
+  const tick = async () => {
+    await fetchTargetXyz();
+    targetXyzTimer = setTimeout(tick, TARGET_XYZ_POLL_INTERVAL_MS);
+  };
+  targetXyzTimer = setTimeout(tick, 0);
 }
 
 function startDataLoop() {

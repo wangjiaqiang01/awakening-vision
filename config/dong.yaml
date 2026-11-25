@@ -17,7 +17,7 @@ serial:
   idle_timeout_ms: 3000
   reconnect_ms: 500
   # Mirror the proven in-team SrmLink behavior: fixed-rate, latest-value-only TX.
-  command_tx_hz: 100
+  command_tx_hz: 1000
   command_timeout_ms: 500
   command_guard:
     # raw = 发送边界完全旁路 command_guard；不是只把阈值放宽。
@@ -37,7 +37,10 @@ serial:
   # 哨兵（IMU 安装 .Pitch = 0）实机验证为 -1；IMU 倒装的车（如六轮步兵 .Pitch = 180）应改为 1。
   # 首次上车先小角度点动：云台朝反方向走就取反，改这里即可，无需重新编译。
   pitch_sign: -1
-serial_send_to_image_microseconds: 2000
+# IMU 时间戳相对图像时间戳的偏移（us）：packet_time = rx_time - serial_send_to_image_microseconds。
+# 负值把 IMU 往后移以补偿相机读出 + USB3 传输延迟（与 omni.yaml=-2500 / leg.yaml=-6000 同方向）；
+# 2026-11-23 摇云台实测标定：2000 时静止目标相位差 +5.75ms（std=0.537°），改为 -3750 后残差 ~0ms（std=0.086°）。
+serial_send_to_image_microseconds: -3750
 use_sim: false
 
 record:
@@ -45,7 +48,7 @@ record:
 
 debug_timing:
   enable: true
-  every_n: 10
+  every_n: 1
   path: log/timing.csv
 
 tf:
@@ -207,7 +210,13 @@ auto_aim_fsm:
 
 very_aimer:
   # WUST 原版没有 type；当前 constructor 必填，显式 limit 即非 MPC 路径
-  type: limit
+  type: mpc
+  # MPC 轨迹复用与取点模式（仅 type: mpc 时生效）：
+  #   vision_d  = 帧驱动 plan 循环（无 1000Hz 定时），不复用旧轨迹，start_at_now 前向窗口 + 滞后前推 + k=1 外推 1 步（dt=0.01s 即 +20ms）
+  #   awakening = 原版 1000Hz solver，居中窗口 + is_same 轨迹复用 + time_in_traj 线性插值
+  mpc_mode: vision_d
+  # 实测云台响应滞后补偿 (ms)，仅 mpc_mode: vision_d 生效；自动扣除 2*dt 前视（参考 vision-d 的 planner_gimbal_response_delay_ms）
+  gimbal_response_delay_ms: 0.0
   base_yaw_offset: 0.3
   base_pitch_offset: -2.3
   # base_yaw_offset: -0.0

@@ -385,6 +385,10 @@ input[type="checkbox"] {
     inset 0 0 18px rgba(0, 79, 140, 0.45);
 }
 
+.target-xyz-box {
+  grid-column: 1 / -1;
+}
+
 .chart-box h4 {
   margin: 0;
   padding: 8px 10px;

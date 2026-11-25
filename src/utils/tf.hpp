@@ -26,6 +26,10 @@ public:
             std::cout << "Time is out of order!" << std::endl;
             return;
         }
+        if (!buffer_.empty() && t == buffer_.back().stamp) {
+            buffer_.back().pose = pose;
+            return;
+        }
 
         buffer_.push_back({ t, pose });
         while (buffer_.size() > max_size_)
@@ -88,6 +92,13 @@ public:
 private:
     static constexpr double kMinDt = 1e-6;
     static constexpr double kMinOmega = 1e-9;
+    // Extrapolation guards: estimate velocity over a real multi-ms baseline so
+    // USB CDC burst packets arriving microseconds apart never amplify dq/dt
+    // into multi-degree pose spikes, and bound the forward horizon.
+    static constexpr double kMinExtrapolateBaselineDt = 0.004;
+    static constexpr double kMaxExtrapolateBaselineDt = 0.050;
+    static constexpr double kMaxExtrapolateFutureDt = 0.020;
+    static constexpr double kMaxExtrapolateOmegaRad = 25.0;
 
     template<typename Duration>
     static double seconds(const Duration& duration) {
@@ -105,14 +116,23 @@ private:
         if (buffer_.size() < 2)
             return buffer_.back().pose;
 
-        const auto& p1 = buffer_[buffer_.size() - 2];
         const auto& p2 = buffer_.back();
+        const double raw_future = seconds(t - p2.stamp);
+        if (raw_future <= 0.0)
+            return p2.pose;
+        const double dt_future = std::min(raw_future, kMaxExtrapolateFutureDt);
 
-        double dt = seconds(p2.stamp - p1.stamp);
-        if (dt < kMinDt)
+        // Walk backward until we have a stable >= 4 ms baseline span.
+        size_t base_idx = buffer_.size() - 2;
+        double dt = seconds(p2.stamp - buffer_[base_idx].stamp);
+        while (base_idx > 0 && dt < kMinExtrapolateBaselineDt) {
+            --base_idx;
+            dt = seconds(p2.stamp - buffer_[base_idx].stamp);
+        }
+        if (dt < kMinExtrapolateBaselineDt || dt > kMaxExtrapolateBaselineDt)
             return p2.pose;
 
-        double dt_future = seconds(t - p2.stamp);
+        const auto& p1 = buffer_[base_idx];
 
         Vec3 v = (p2.pose.translation() - p1.pose.translation()) / dt;
         Vec3 trans = p2.pose.translation() + v * dt_future;
@@ -127,10 +147,12 @@ private:
         Vec3 omega = aa.axis() * aa.angle() / dt;
 
         double omega_norm = omega.norm();
-        double angle = omega_norm * dt_future;
         Vec3 axis = Vec3::UnitX();
-        if (omega_norm > kMinOmega)
+        if (omega_norm > kMinOmega) {
             axis = omega / omega_norm;
+            omega_norm = std::min(omega_norm, kMaxExtrapolateOmegaRad);
+        }
+        double angle = omega_norm * dt_future;
 
         Quaternion q_future = (q2 * Quaternion(AngleAxis(angle, axis))).normalized();
 

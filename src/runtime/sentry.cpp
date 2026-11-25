@@ -31,6 +31,7 @@
 #include "backward-cpp/backward.hpp"
 #include "param_deliver.h"
 #include "runtime/config.hpp"
+#include "runtime/frame_plan_loop.hpp"
 #include "tasks/auto_aim/armor_control/very_aimer.hpp"
 #include "utils/drivers/camera_factory.hpp"
 #include "utils/drivers/command_protocol.hpp"
@@ -298,7 +299,6 @@ int main(int argc, char** argv) {
     // 同济状态回传的消息 ID，必须与下位机 InitParam() 的注册一致（见 config/sentry.yaml）。
     const int telemetry_gimbal_id = config["serial"]["telemetry_gimbal_id"].as<int>(-1);
     const int telemetry_shoot_id = config["serial"]["telemetry_shoot_id"].as<int>(-1);
-    const int telemetry_frame_timeout_ms = config["serial"]["frame_timeout_ms"].as<int>(1000);
 
     s.register_task<CameraIO, CommonFrameIo>("push_common_frame", [&](CameraIO::second_type&& f) {
         static int current_id = 0;
@@ -316,64 +316,46 @@ int main(int argc, char** argv) {
 
         return std::make_tuple(std::optional<CommonFrameIo::second_type>(std::move(frame)));
     });
-    if (serial) {
-        s.register_task<SerialIO>("receive_serial", [&](SerialIO::second_type&& data) {
-            static std::mutex mutex;
-            // 下位机约 1kHz 连续发送 30 字节定长帧（int16 长度 + [int16 ID][payload]）：
-            //   ID 1 -> {float yaw, float pitch, float roll, int32 mode, int32 robot_id}（角度单位「度」）
-            //   ID 2 -> {float bullet_speed}
-            static TelemetryStream stream{std::chrono::milliseconds(telemetry_frame_timeout_ms)};
-            std::lock_guard<std::mutex> lock(mutex);
-
-            const auto packet_time =
-                Clock::now() - std::chrono::microseconds(serial_send_to_image_microseconds);
-            const bool ok = stream.feed(
-                data.data(),
-                data.size(),
-                TelemetryStream::Clock::now(),
-                [&](const uint8_t* p, size_t n) {
-                    TongjiTelemetry state {};
-                    if (!TongjiTelemetry::decode(
-                            p,
-                            n,
-                            telemetry_gimbal_id,
-                            telemetry_shoot_id,
-                            state
-                        ))
-                    {
-                        return;
-                    }
-                    log_ctx.serial_count++;
-                    // 云台姿态反馈 GIMBAL_ODOM -> GIMBAL：自瞄解算的输入基准，必须持续更新，
-                    // 否则 very_aimer 拿到的云台位姿会退化成单位变换。
-                    ISO3 gimbal_in_gimbal_odom = ISO3::Identity();
-                    gimbal_in_gimbal_odom.linear() = utils::rpy2matrix(
-                        Vec3(
-                            angles::from_degrees(state.roll),
-                            angles::from_degrees(state.pitch),
-                            angles::from_degrees(state.yaw)
-                        ),
-                        utils::RPYOrder::ZYX
-                    );
-                    tf->push(
-                        SentryFrame::GIMBAL_ODOM,
-                        SentryFrame::GIMBAL,
-                        packet_time,
-                        gimbal_in_gimbal_odom
-                    );
-                    // 说明：该版本固件的状态回传里没有 v_x/v_y/v_z、big_yaw_in_world、
-                    // bullet_count 与裁判系统数据，因此：
-                    //   ODOM->GIMBAL_ODOM、GIMBAL_ODOM->BIG_YAW 保持单位变换；
-                    //   enemy_color / bullet_speed 继续由 config/sentry.yaml 决定
-                    //   （固件回传的 color 实为 robot_id 且哨兵恒为 0，bullet_speed 恒为 22.0）；
-                    //   BulletPickUp 的弹道事件与 brain 的裁判数据输入暂时不可用。
-                }
-            );
-            if (!ok) {
-                // 粘包错位或半帧超时：主动复位解析器，避免它永久停留在 failed 状态。
-                AWAKENING_WARN("Serial frame desync; resetting telemetry stream parser");
-                stream.reset();
+    const bool direct_telemetry_tf =
+        serial && telemetry_gimbal_id > 0 && telemetry_shoot_id > 0;
+    const auto serial_tf_offset = direct_telemetry_tf
+        ? std::chrono::microseconds(serial_send_to_image_microseconds)
+        : std::chrono::microseconds(0);
+    auto serial_rx_counter = std::make_shared<std::atomic<int>>(0);
+    if (direct_telemetry_tf) {
+        // 直接在 SerialDriver 单 IO 线程入 TF：按单次 USB 读取批次取最新帧并打接收时刻，
+        // 避免经由 Scheduler 并发 TBB 队列乱序与微秒级假间隔污染 TimePoseBuffer。
+        serial->set_telemetry_callback(
+            [tf, serial_tf_offset, serial_rx_counter](
+                const TongjiTelemetry& state,
+                std::chrono::system_clock::time_point rx_wall_time,
+                std::size_t batch_frames
+            ) {
+                serial_rx_counter->fetch_add(
+                    static_cast<int>(batch_frames), std::memory_order_relaxed
+                );
+                const auto packet_time = rx_wall_time - serial_tf_offset;
+                ISO3 gimbal_in_gimbal_odom = ISO3::Identity();
+                gimbal_in_gimbal_odom.linear() = utils::rpy2matrix(
+                    Vec3(
+                        angles::from_degrees(state.roll),
+                        angles::from_degrees(state.pitch),
+                        angles::from_degrees(state.yaw)
+                    ),
+                    utils::RPYOrder::ZYX
+                );
+                tf->push(
+                    SentryFrame::GIMBAL_ODOM,
+                    SentryFrame::GIMBAL,
+                    packet_time,
+                    gimbal_in_gimbal_odom
+                );
             }
+        );
+    }
+    if (serial) {
+        s.register_task<SerialIO>("receive_serial", [direct_telemetry_tf](SerialIO::second_type&&) {
+            if (direct_telemetry_tf) return;
         });
     }
     if (camera) {
@@ -519,9 +501,16 @@ int main(int argc, char** argv) {
         return std::make_tuple(std::optional<DetIo::second_type>(std::move(r)));
     });
 
-    s.register_task<DetIo>("tracker", [&](DetIo::second_type&& io) {
-        static std::mutex mutex;
-        std::lock_guard<std::mutex> lock(mutex);
+    const bool vision_d_plan_loop = very_aimer.uses_vision_d_mpc();
+    auto plan_signal = std::make_shared<runtime::FramePlanLoop::Signal>();
+    std::mutex solver_mutex;
+    std::function<void()> run_solver_step;
+
+    s.register_task<DetIo>("tracker", [&, plan_signal](DetIo::second_type&& io) {
+        bool updated = false;
+        {
+            static std::mutex mutex;
+            std::lock_guard<std::mutex> lock(mutex);
         if (io.armors) {
             for (const auto& armors_raw: io.armors.value()) {
                 auto armors = armors_raw;
@@ -553,6 +542,7 @@ int main(int argc, char** argv) {
                     __armor_target.get_target_state().timestamp
                 );
                 armor_target.write(__armor_target);
+                updated = true;
                 if (io.detect_start) {
                     auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                           Clock::now() - io.detect_start.value()
@@ -590,6 +580,7 @@ int main(int argc, char** argv) {
                     rune_tracker.track(rune, camera_info, camera_cv_in_odom, rune.frame_id);
 
                 rune_target.write(__rune_target);
+                updated = true;
                 if (io.detect_start) {
                     auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                           Clock::now() - io.detect_start.value()
@@ -606,8 +597,13 @@ int main(int argc, char** argv) {
                 log_ctx.track_count++;
             }
         }
+        }
+        if (vision_d_plan_loop && updated) {
+            plan_signal->notify();
+        }
     });
-    s.add_rate_source<>("solver", 1000.0, [&]() {
+    run_solver_step = [&]() {
+        std::lock_guard<std::mutex> solver_lock(solver_mutex);
         log_ctx.solve_count++;
         bool is_omni = false;
         auto a_target = armor_target.read(); //需要转为相对gimbal_odom
@@ -647,10 +643,11 @@ int main(int argc, char** argv) {
         GimbalCmd cmd {
             .appear = false,
         };
+        const auto solver_tf_now = Clock::now() - serial_tf_offset;
         auto shoot_in_gimbal_odom =
-            tf->pose_a_in_b(SentryFrame::SHOOT, SentryFrame::GIMBAL_ODOM, Clock::now());
+            tf->pose_a_in_b(SentryFrame::SHOOT, SentryFrame::GIMBAL_ODOM, solver_tf_now);
         auto gimbal_in_gimbal_odom =
-            tf->pose_a_in_b(SentryFrame::GIMBAL, SentryFrame::GIMBAL_ODOM, Clock::now());
+            tf->pose_a_in_b(SentryFrame::GIMBAL, SentryFrame::GIMBAL_ODOM, solver_tf_now);
         if (a_target.check()) {
             cmd = very_aimer.very_aim(
                 a_target,
@@ -687,13 +684,26 @@ int main(int argc, char** argv) {
         auto old_in_camera_cv = tf->pose_a_in_b(
             SentryFrame(cmd.aim_point.frame_id),
             SentryFrame::CAMERA_CV,
-            cmd.timestamp
+            cmd.timestamp - serial_tf_offset
         );
         cmd.aim_point.transform(old_in_camera_cv, std::to_underlying(SentryFrame::CAMERA_CV));
         if (dbg && is_web_running()) {
             dbg->gimbal_cmd.set(cmd);
         }
-    });
+    };
+    runtime::FramePlanLoop plan_loop(plan_signal);
+    if (vision_d_plan_loop) {
+        AWAKENING_INFO(
+            "solver loop: vision_d dedicated frame-driven plan thread (1000 Hz rate source disabled)"
+        );
+    } else {
+        s.add_rate_source<>("solver", 1000.0, [&]() { run_solver_step(); });
+        AWAKENING_INFO(
+            "solver loop: 1000 Hz rate source (type={}, mpc_mode={})",
+            config["very_aimer"]["type"].as<std::string>("unknown"),
+            auto_aim::VeryAimer::mpc_mode_name(very_aimer.mpc_mode())
+        );
+    }
     if (armor_omni) {
         auto armor_omni_task = s.register_source<>("armor_omni");
         s.add_rate_source<>("armor_omni_tragger", armor_omni->fps_, [&, armor_omni_task]() {
@@ -713,7 +723,7 @@ int main(int argc, char** argv) {
         common_frame.frame_id = one.cv_frame_id;
         common_frame.id = one.order_id++;
 
-        s.runtime_push_source<>(armor_omni_task, [&, f = std::move(common_frame)]() {
+        s.runtime_push_source<>(armor_omni_task, [&, plan_signal, f = std::move(common_frame)]() {
             static std::unique_ptr<std::counting_semaphore<>> detector_sem;
             if (!detector_sem) {
                 detector_sem = std::make_unique<std::counting_semaphore<>>(
@@ -751,6 +761,7 @@ int main(int argc, char** argv) {
             }
 
             auto batch_armors = one.armors_queue->dequeue_batch();
+            bool omni_updated = false;
             {
                 static std::mutex mutex;
                 std::lock_guard<std::mutex> lock(mutex);
@@ -771,6 +782,7 @@ int main(int argc, char** argv) {
                     one.total_score = one.target.update_count;
                     auto best_target = armor_omni->update();
                     omni_armor_target.write(best_target);
+                    omni_updated = true;
                     auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                           Clock::now() - _armors.timestamp
                     )
@@ -788,6 +800,9 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            if (vision_d_plan_loop && omni_updated) {
+                plan_signal->notify();
+            }
         });
         });
     }
@@ -798,13 +813,15 @@ int main(int argc, char** argv) {
         double omni_avg_latency_ms = log_ctx.omni_count > 0
             ? log_ctx.omni_latency_ms_total / log_ctx.omni_count
             : 0.0;
+        const int serial_count =
+            log_ctx.serial_count + serial_rx_counter->exchange(0, std::memory_order_relaxed);
         AWAKENING_INFO(
             "detect: {} track: {} found: {} solve: {} serial: {} camera: {} avg_latency: {:.3} ms omni: {} avg_latency: {:.3} ms ",
             log_ctx.detect_count,
             log_ctx.track_count,
             log_ctx.found_count,
             log_ctx.solve_count,
-            log_ctx.serial_count,
+            serial_count,
             log_ctx.camera_count,
             avg_latency_ms,
             log_ctx.omni_count,
@@ -832,8 +849,9 @@ int main(int argc, char** argv) {
             dbg->armor_target.set(__armor_target);
             dbg->rune_target.set(__rune_target);
             dbg->auto_aim_fsm_state.set(auto_aim_fsm_controller.get_state());
-            auto gimbal_in_gimbal_odom =
-                tf->pose_a_in_b(SentryFrame::GIMBAL, SentryFrame::GIMBAL_ODOM, Clock::now());
+            auto gimbal_in_gimbal_odom = tf->pose_a_in_b(
+                SentryFrame::GIMBAL, SentryFrame::GIMBAL_ODOM, Clock::now() - serial_tf_offset
+            );
             auto rpy = utils::matrix2rpy<double>(gimbal_in_gimbal_odom.linear());
             auto gimbal_yaw_pitch =
                 std::make_pair(angles::to_degrees(rpy[2]), -angles::to_degrees(rpy[1]));
@@ -921,6 +939,9 @@ int main(int argc, char** argv) {
         brain->start();
     }
     s.build();
+    if (vision_d_plan_loop) {
+        plan_loop.start(run_solver_step);
+    }
     s.run();
 
 #ifdef USE_ROS2
@@ -928,6 +949,10 @@ int main(int argc, char** argv) {
 #endif
     utils::SignalGuard::spin(std::chrono::milliseconds(1000));
     s.stop();
+    plan_loop.stop();
+    if (serial) {
+        serial->stop();
+    }
 #ifdef USE_ROS2
     rcl_node.shutdown();
 #endif

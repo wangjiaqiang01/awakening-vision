@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <tbb/parallel_invoke.h>
+#include <tbb/task_arena.h>
 #include <utility>
 #include <vector>
 namespace awakening::dta_utils {
@@ -752,18 +753,21 @@ public:
     bool solve(
         const Trajectory<GimbalState::State, double>& ref_traj,
         Trajectory<GimbalState::State, double>& control_traj,
-        double t_current
+        double t_current,
+        bool start_at_now = false,
+        std::optional<double> x0_vel_override = std::nullopt
     ) {
         auto make_even = [](int x) { return x % 2 == 0 ? x : x + 1; };
         const int mpc_horizon = make_even(params_.horizon) + 1;
         const int half_horizon = make_even(params_.horizon) / 2;
+        const auto step_time = [&](int k) {
+            const int i = start_at_now ? k : (k - half_horizon);
+            return t_current + i * params_.dt;
+        };
         const auto trajVecToEigen = [&](const Trajectory<GimbalState::State, double>& traj) {
             Eigen::Matrix<double, 2, Eigen::Dynamic> mat(2, mpc_horizon);
             for (int k = 0; k < mpc_horizon; ++k) {
-                int i = k - half_horizon;
-                double t_add = i * params_.dt;
-                double t = t_current + t_add;
-                auto state = traj.Trajectory::state_at(t);
+                auto state = traj.Trajectory::state_at(step_time(k));
                 mat(0, k) = state.p;
                 mat(1, k) = state.v;
             }
@@ -771,6 +775,9 @@ public:
             return mat;
         };
         auto traj_eigen = trajVecToEigen(ref_traj);
+        if (x0_vel_override.has_value() && std::isfinite(*x0_vel_override)) {
+            traj_eigen(1, 0) = *x0_vel_override;
+        }
         Eigen::VectorXd x0(2);
         x0 << traj_eigen(0, 0), traj_eigen(1, 0);
         tiny_set_x0(_solver, x0);
@@ -789,10 +796,7 @@ public:
             } else {
                 tp.a = _solver->work->u(0, k);
             }
-            int i = k - half_horizon;
-            double t_add = i * params_.dt;
-            double t = t_current + t_add;
-            control_traj.push_back(tp, t);
+            control_traj.push_back(tp, step_time(k));
         }
         return true;
     }
@@ -836,19 +840,27 @@ public:
             s[i].pitch_state.p = angles::unwrap_angle(s[i - 1].pitch_state.p, s[i].pitch_state.p);
         }
     }
-    bool solve(Trajectory<GimbalState, double>& ref_traj, double t_current) {
+    bool solve(
+        Trajectory<GimbalState, double>& ref_traj,
+        double t_current,
+        bool start_at_now = false,
+        std::optional<double> x0_yaw_vel = std::nullopt,
+        std::optional<double> x0_pitch_vel = std::nullopt
+    ) {
         unwrap_states(ref_traj.get_cp_vec());
         Trajectory<GimbalState::State, double> yaw_ref_traj;
         Trajectory<GimbalState::State, double> pitch_ref_traj;
         const auto& yp_cp = ref_traj.get_cp_vec();
         const auto& yp_prefix = ref_traj.get_prefix();
-        for (int i = 0; i < yp_cp.size(); ++i) {
+        for (size_t i = 0; i < yp_cp.size(); ++i) {
             yaw_ref_traj.push_back(yp_cp[i].yaw_state, yp_prefix[i]);
             pitch_ref_traj.push_back(yp_cp[i].pitch_state, yp_prefix[i]);
         }
         auto compute_va = [&](Trajectory<GimbalState::State, double>& j) {
             auto& s = j.get_cp_vec();
             const auto& prefix = j.get_prefix();
+            if (s.empty())
+                return;
             s.front().v = s.back().v = 0.0;
             s.front().a = s.back().a = 0.0;
 
@@ -863,25 +875,62 @@ public:
 
                 s[i].a = 2.0 * ((s[i + 1].p - s[i].p) / dt1 - (s[i].p - s[i - 1].p) / dt0) / denom;
             }
+            if (start_at_now && s.size() >= 2) {
+                const double dt_head = prefix[1] - prefix[0];
+                const double dt_tail = prefix.back() - prefix[prefix.size() - 2];
+                if (dt_head > 1e-9) {
+                    s.front().v = (s[1].p - s[0].p) / dt_head;
+                }
+                if (dt_tail > 1e-9) {
+                    s.back().v = (s.back().p - s[s.size() - 2].p) / dt_tail;
+                }
+            }
         };
         bool yaw_ok = true;
         bool pitch_ok = true;
-        tbb::parallel_invoke(
-            [&]() {
-                compute_va(yaw_ref_traj);
-                yaw_ok = yaw_solver_.solve(yaw_ref_traj, yaw_control_traj_, t_current);
-            },
-            [&]() {
-                compute_va(pitch_ref_traj);
-                pitch_ok = pitch_solver_.solve(pitch_ref_traj, pitch_control_traj_, t_current);
-            }
-        );
+        // Isolate parallel_invoke so a calling TBB worker thread can never steal
+        // outer Scheduler tasks while waiting for the sibling axis solve (which
+        // would self-deadlock on any non-recursive mutex held by the caller).
+        tbb::this_task_arena::isolate([&]() {
+            tbb::parallel_invoke(
+                [&]() {
+                    compute_va(yaw_ref_traj);
+                    yaw_ok = yaw_solver_.solve(
+                        yaw_ref_traj,
+                        yaw_control_traj_,
+                        t_current,
+                        start_at_now,
+                        x0_yaw_vel
+                    );
+                },
+                [&]() {
+                    compute_va(pitch_ref_traj);
+                    pitch_ok = pitch_solver_.solve(
+                        pitch_ref_traj,
+                        pitch_control_traj_,
+                        t_current,
+                        start_at_now,
+                        x0_pitch_vel
+                    );
+                }
+            );
+        });
         return yaw_ok && pitch_ok;
     };
     [[nodiscard]] inline GimbalState state_at(double t) const noexcept {
         GimbalState::State yaw = yaw_control_traj_.state_at(t);
         GimbalState::State pitch = pitch_control_traj_.state_at(t);
         return GimbalState(yaw, pitch);
+    }
+    [[nodiscard]] inline GimbalState step_state(size_t k) const noexcept {
+        if (yaw_control_traj_.empty() || pitch_control_traj_.empty())
+            return {};
+        const size_t yaw_idx = std::min(k, yaw_control_traj_.size() - 1);
+        const size_t pitch_idx = std::min(k, pitch_control_traj_.size() - 1);
+        return GimbalState(
+            yaw_control_traj_.state_at(yaw_idx),
+            pitch_control_traj_.state_at(pitch_idx)
+        );
     }
 };
 

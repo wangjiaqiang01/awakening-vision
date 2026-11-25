@@ -11,9 +11,29 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 namespace awakening::auto_aim {
+namespace {
+MpcMode parse_mpc_mode(const YAML::Node& config) {
+    if (!config["mpc_mode"]) {
+        return MpcMode::VisionD;
+    }
+    const std::string mode = utils::to_upper(config["mpc_mode"].as<std::string>());
+    if (mode == "VISION_D" || mode == "VISION-D") {
+        return MpcMode::VisionD;
+    }
+    if (mode == "AWAKENING") {
+        return MpcMode::Awakening;
+    }
+    throw std::invalid_argument(
+        "very_aimer: invalid mpc_mode '" + config["mpc_mode"].as<std::string>()
+        + "' (expected 'vision_d' or 'awakening')"
+    );
+}
+} // namespace
+
 struct VeryAimer::Impl {
     struct Params {
         double sample_total_time;
@@ -29,6 +49,8 @@ struct VeryAimer::Impl {
         double shooting_range_w_large;
         double min_enable_pitch_deg;
         double min_enable_yaw_deg;
+        MpcMode mpc_mode = MpcMode::VisionD;
+        double gimbal_response_delay_ms = 0.0;
 
         void load(const YAML::Node& config) {
             sample_total_time = config["sample_total_time"].as<double>();
@@ -45,6 +67,24 @@ struct VeryAimer::Impl {
             shooting_range_w_large = config["shooting_range_w_large"].as<double>();
             min_enable_pitch_deg = config["min_enable_pitch_deg"].as<double>();
             min_enable_yaw_deg = config["min_enable_yaw_deg"].as<double>();
+            mpc_mode = parse_mpc_mode(config);
+            gimbal_response_delay_ms = config["gimbal_response_delay_ms"]
+                ? config["gimbal_response_delay_ms"].as<double>()
+                : 0.0;
+            if (!std::isfinite(sample_total_time) || sample_total_time <= 0.0
+                || sample_horizon < 2)
+            {
+                throw std::invalid_argument(
+                    "very_aimer: sample_total_time must be > 0 and sample_horizon >= 2"
+                );
+            }
+            if (!std::isfinite(gimbal_response_delay_ms) || gimbal_response_delay_ms < 0.0
+                || gimbal_response_delay_ms > 100.0)
+            {
+                throw std::invalid_argument(
+                    "very_aimer: gimbal_response_delay_ms must be finite and in [0, 100]"
+                );
+            }
         }
     } params_;
     using MPCType = dta_utils::TinyMpcTrajectory;
@@ -55,16 +95,28 @@ struct VeryAimer::Impl {
         base_pitch_offset_rad_ = angles::from_degrees(config["base_pitch_offset"].as<double>());
         auto type = config["type"].as<std::string>();
         if (type == "mpc" || type == "MPC") {
+            const int horizon =
+                params_.sample_horizon % 2 == 0 ? params_.sample_horizon : params_.sample_horizon + 1;
             MPCType::Params mpc_p {
                 .yaw_max_acc = (float)params_.max_yaw_acc,
                 .pitch_max_acc = (float)params_.max_pitch_acc,
-                .horizon = params_.sample_horizon,
-                .dt = params_.sample_total_time / params_.sample_horizon,
+                .horizon = horizon,
+                .dt = params_.sample_total_time / horizon,
                 .max_iter = 10,
             };
             mpc_traj_ = MPCType::create(mpc_p);
-            AWAKENING_INFO("very_aimer: using  MpcTrajectory");
+            AWAKENING_INFO(
+                "very_aimer: using MpcTrajectory (mpc_mode={}, gimbal_response_delay_ms={})",
+                VeryAimer::mpc_mode_name(params_.mpc_mode),
+                params_.gimbal_response_delay_ms
+            );
         }
+    }
+    [[nodiscard]] bool uses_vision_d_mpc() const noexcept {
+        return mpc_traj_ != nullptr && params_.mpc_mode == MpcMode::VisionD;
+    }
+    [[nodiscard]] MpcMode mpc_mode() const noexcept {
+        return params_.mpc_mode;
     }
     [[nodiscard]] int
     select_armor(const ArmorTarget& target, const AutoAimFsm& auto_aim_fsm) const noexcept {
@@ -194,15 +246,15 @@ struct VeryAimer::Impl {
         cp.aim_id = aim_id;
         return cp;
     };
-    [[nodiscard]] dta_utils::ControlPoint select_and_get_control_point(
+    [[nodiscard]] dta_utils::ControlPoint get_control_point_for_armor(
         const ArmorTarget& target,
         double bullet_speed,
         const AutoAimFsm& fsm,
+        int selected_armor,
         const ISO3& shoot_in_gimbal_odom,
         const ISO3& gimbal_in_gimbal_odom
     ) const noexcept {
         const auto& target_state = target.get_target_state();
-        const int selected_armor = select_armor(target, fsm);
         auto armors_pose = target_state.get_armors_pose(target.target_number);
         if (selected_armor < 0 || selected_armor >= static_cast<int>(armors_pose.size())) {
             dta_utils::ControlPoint cp;
@@ -223,6 +275,23 @@ struct VeryAimer::Impl {
             gimbal_in_gimbal_odom,
             bullet_speed,
             selected_armor
+        );
+    }
+    [[nodiscard]] dta_utils::ControlPoint select_and_get_control_point(
+        const ArmorTarget& target,
+        double bullet_speed,
+        const AutoAimFsm& fsm,
+        const ISO3& shoot_in_gimbal_odom,
+        const ISO3& gimbal_in_gimbal_odom
+    ) const noexcept {
+        const int selected_armor = select_armor(target, fsm);
+        return get_control_point_for_armor(
+            target,
+            bullet_speed,
+            fsm,
+            selected_armor,
+            shoot_in_gimbal_odom,
+            gimbal_in_gimbal_odom
         );
     }
     struct HitCtx {
@@ -332,6 +401,7 @@ struct VeryAimer::Impl {
     dta_utils::ControlPoint aim_center_target_traj_cp0_;
     double last_fly_time_ = 0.0;
     int last_select_ = -1;
+    VeryAimDebugInfo debug_;
     [[nodiscard]] GimbalCmd very_aim(
         const ArmorTarget& _target,
         double bullet_speed,
@@ -344,9 +414,21 @@ struct VeryAimer::Impl {
         }
         GimbalCmd cmd;
         cmd.appear = false;
-        bool is_same =
-            last_input_
-                .is_same(_target, bullet_speed, fsm, shoot_in_gimbal_odom, gimbal_in_gimbal_odom);
+
+        const bool use_vision_d = uses_vision_d_mpc();
+        const bool prev_valid = last_input_.valid;
+        const bool this_id_same = prev_valid && _target.this_id == last_input_.target.this_id;
+        const bool fsm_same = prev_valid && fsm == last_input_.fsm;
+        const bool bullet_speed_same =
+            prev_valid && std::abs(bullet_speed - last_input_.bullet_speed) < 1e-2;
+        const bool shoot_pose_same = prev_valid
+            && shoot_in_gimbal_odom.isApprox(last_input_.shoot_in_gimbal_odom, 1e-2);
+        const bool gimbal_pose_same = prev_valid
+            && gimbal_in_gimbal_odom.isApprox(last_input_.gimbal_in_gimbal_odom, 1e-2);
+        // vision_d 模式对齐新真机哨兵链路：每次调用直接重算前向窗口，不复用旧轨迹插值。
+        const bool is_same = !use_vision_d && prev_valid && this_id_same && fsm_same
+            && bullet_speed_same && shoot_pose_same && gimbal_pose_same;
+
         double time_in_traj = 0.0;
         const auto now = Clock::now();
         if (is_same) { //状态完全未更新，使用第一次构建的轨迹基于时间进行推进减少重复计算
@@ -356,6 +438,16 @@ struct VeryAimer::Impl {
                 .set(_target, bullet_speed, fsm, shoot_in_gimbal_odom, gimbal_in_gimbal_odom);
             last_time_ = now;
         }
+
+        debug_ = VeryAimDebugInfo {};
+        debug_.valid = true;
+        debug_.is_same = is_same;
+        debug_.this_id_same = this_id_same;
+        debug_.fsm_same = fsm_same;
+        debug_.bullet_speed_same = bullet_speed_same;
+        debug_.shoot_pose_same = shoot_pose_same;
+        debug_.gimbal_pose_same = gimbal_pose_same;
+        debug_.time_in_traj_s = time_in_traj;
         auto target = _target.fast_copy_without_ekf();
         target.set_target_state([&](armor_point_motion_model::State& state) {
             state.predict(now, target.target_number);
@@ -363,6 +455,17 @@ struct VeryAimer::Impl {
         auto make_even = [](int x) { return x % 2 == 0 ? x : x + 1; };
         const int horizon = make_even(params_.sample_horizon);
         const double dt = params_.sample_total_time / horizon;
+        // vision_d 模式下发时刻在规划时刻后 2*dt（dt=0.01s 即 20ms），
+        // 只额外前推实测云台响应滞后超出 2*dt 的部分。
+        const double extra_lead_s = use_vision_d
+            ? std::max(0.0, params_.gimbal_response_delay_ms * 1e-3 - 2.0 * dt)
+            : 0.0;
+        auto plan_target = target.fast_copy_without_ekf();
+        if (extra_lead_s > 0.0) {
+            plan_target.set_target_state([&](armor_point_motion_model::State& state) {
+                state.predict(extra_lead_s, plan_target.target_number);
+            });
+        }
         auto sample_once = [&](double t,
                                const ArmorTarget& base_target,
                                AutoAimFsm fsm_mode,
@@ -398,7 +501,7 @@ struct VeryAimer::Impl {
                                AutoAimFsm fsm_mode) -> bool {
             dta_utils::GimbalState gs;
             AimPoint ap;
-            if (!sample_once(t, target, fsm_mode, _cp0, gs, ap)) {
+            if (!sample_once(t, plan_target, fsm_mode, _cp0, gs, ap)) {
                 return false;
             }
             traj_gs.push_back(gs, t);
@@ -407,7 +510,7 @@ struct VeryAimer::Impl {
         };
         if (!is_same) {
             auto hit_ctx_opt =
-                get_hit(target, bullet_speed, fsm, shoot_in_gimbal_odom); //直接算到击中目标时间
+                get_hit(plan_target, bullet_speed, fsm, shoot_in_gimbal_odom); //直接算到击中目标时间
             if (!hit_ctx_opt) {
                 return cmd;
             }
@@ -430,6 +533,22 @@ struct VeryAimer::Impl {
                                   AutoAimFsm fsm_mode,
                                   int horizon,
                                   double dt) -> bool {
+                if (use_vision_d) {
+                    dta_utils::GimbalState gs0;
+                    gs0.aim_id = _cp0.aim_id;
+                    gs0.yaw_state.p = 0.0;
+                    gs0.pitch_state.p = 0.0;
+                    traj_gs.push_back(gs0, 0.0);
+                    traj_ap.push_back(_cp0.aim_point, 0.0);
+
+                    for (int i = 1; i <= horizon; ++i) {
+                        if (!push_sample(traj_gs, traj_ap, i * dt, _cp0, fsm_mode)) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+
                 int half = horizon / 2;
                 for (int i = half; i >= 1; --i) {
                     if (!push_sample(traj_gs, traj_ap, -i * dt, _cp0, fsm_mode)) {
@@ -461,8 +580,9 @@ struct VeryAimer::Impl {
                 // 原实现会让整条轨迹构建失败，standard 随后发 idle/保持上一帧，
                 // 云台表现为突然不动。这里退化为“保持当前有效控制点”的
                 // 常值轨迹，至少不会丢输出，也不会把非法点送给 MPC。
-                const int half = horizon / 2;
-                for (int i = -half; i <= half; ++i) {
+                const int begin_idx = use_vision_d ? 0 : -(horizon / 2);
+                const int end_idx = use_vision_d ? horizon : (horizon / 2);
+                for (int i = begin_idx; i <= end_idx; ++i) {
                     dta_utils::GimbalState gs;
                     gs.aim_id = _cp0.aim_id;
                     gs.yaw_state.p = 0.0;
@@ -477,7 +597,9 @@ struct VeryAimer::Impl {
             limit_traj_.reserve(horizon + 1);
             aim_traj_.reserve(horizon + 1);
 
-            if (!build_traj(limit_traj_, aim_traj_, limit_traj_cp0_, fsm, horizon, dt)) {
+            const bool traj_built =
+                build_traj(limit_traj_, aim_traj_, limit_traj_cp0_, fsm, horizon, dt);
+            if (!traj_built) {
                 AWAKENING_WARN(
                     "very_aimer: build_traj failed, holding current valid control point"
                 );
@@ -488,7 +610,57 @@ struct VeryAimer::Impl {
             if (!mpc_traj_) {
                 limit_traj_.build_limit(params_.max_yaw_acc, params_.max_pitch_acc, time_in_traj);
             } else {
-                if (!mpc_traj_->solve(limit_traj_, time_in_traj)) {
+                std::optional<double> x0_yaw_vel;
+                std::optional<double> x0_pitch_vel;
+                if (use_vision_d) {
+                    if (traj_built) {
+                        // 对齐 vision-d reference_mode：初始速度只从当前板的连续轨迹中心差分求取，
+                        // 避免换板阶跃污染 x0。
+                        auto before_target = hit_ctx.hit_time_target.fast_copy_without_ekf();
+                        auto after_target = hit_ctx.hit_time_target.fast_copy_without_ekf();
+                        before_target.set_target_state([&](armor_point_motion_model::State& state) {
+                            state.predict(-dt, before_target.target_number);
+                        });
+                        after_target.set_target_state([&](armor_point_motion_model::State& state) {
+                            state.predict(dt, after_target.target_number);
+                        });
+                        const auto cp_before = get_control_point_for_armor(
+                            before_target,
+                            bullet_speed,
+                            fsm,
+                            cp0.aim_id,
+                            shoot_in_gimbal_odom,
+                            gimbal_in_gimbal_odom
+                        );
+                        const auto cp_after = get_control_point_for_armor(
+                            after_target,
+                            bullet_speed,
+                            fsm,
+                            cp0.aim_id,
+                            shoot_in_gimbal_odom,
+                            gimbal_in_gimbal_odom
+                        );
+                        if (cp_before.valid && cp_after.valid) {
+                            x0_yaw_vel =
+                                angles::shortest_angular_distance(cp_before.yaw, cp_after.yaw)
+                                / (2.0 * dt);
+                            x0_pitch_vel =
+                                angles::shortest_angular_distance(cp_before.pitch, cp_after.pitch)
+                                / (2.0 * dt);
+                        }
+                    } else {
+                        x0_yaw_vel = 0.0;
+                        x0_pitch_vel = 0.0;
+                    }
+                }
+                if (!mpc_traj_->solve(
+                        limit_traj_,
+                        time_in_traj,
+                        use_vision_d,
+                        x0_yaw_vel,
+                        x0_pitch_vel
+                    ))
+                {
                     AWAKENING_ERROR("very_aimer: mpc solve failed");
                     return cmd;
                 }
@@ -498,7 +670,7 @@ struct VeryAimer::Impl {
                 aim_center_target_traj_.clear();
                 aim_center_target_traj_.reserve(horizon + 1);
                 auto aim_center_target_hit_ctx_opt = get_hit(
-                    target,
+                    plan_target,
                     bullet_speed,
                     AutoAimFsm::AIM_WHOLE_CAR_ARMOR,
                     shoot_in_gimbal_odom
@@ -588,6 +760,7 @@ struct VeryAimer::Impl {
             }
         }
 
+        const double eval_time = use_vision_d ? (2.0 * dt) : time_in_traj;
         const bool use_center_target = fsm == AutoAimFsm::AIM_WHOLE_CAR_CENTER;
         const dta_utils::ControlPoint& target_traj_cp0 =
             use_center_target ? aim_center_target_traj_cp0_ : limit_traj_cp0_;
@@ -597,7 +770,7 @@ struct VeryAimer::Impl {
             : static_cast<const Trajectory<dta_utils::GimbalState, double>&>(limit_traj_);
         const Trajectory<AimPoint, double>& aim_traj =
             use_center_target ? aim_center_aim_traj_ : aim_traj_;
-        auto target_gimbal_state = target_traj.Trajectory::state_at(time_in_traj);
+        auto target_gimbal_state = target_traj.Trajectory::state_at(eval_time);
         //目标轨迹，一定击中目标
         auto get_control = [&](double t) {
             if (!mpc_traj_) {
@@ -606,7 +779,21 @@ struct VeryAimer::Impl {
                 return mpc_traj_->state_at(t);
             }
         };
-        auto control = get_control(time_in_traj);
+        dta_utils::GimbalState control;
+        if (use_vision_d) {
+            // 对齐 vision-d 6 参 Planner::plan + 下发外推：
+            // 取第 1 步 (+dt) 的位置和速度、u(0, 0) 的加速度，位置再外推 1 步到 +2*dt（dt=0.01s 即 +20ms）。
+            const auto step0 = mpc_traj_->step_state(0);
+            const auto step1 = mpc_traj_->step_state(1);
+            control.yaw_state.p = step1.yaw_state.p + dt * step1.yaw_state.v;
+            control.yaw_state.v = step1.yaw_state.v;
+            control.yaw_state.a = step0.yaw_state.a;
+            control.pitch_state.p = step1.pitch_state.p + dt * step1.pitch_state.v;
+            control.pitch_state.v = step1.pitch_state.v;
+            control.pitch_state.a = step0.pitch_state.a;
+        } else {
+            control = get_control(time_in_traj);
+        }
         //控制轨迹，轨迹优化后最优控制（并非最优，下位机实际vel acc 可以基于error和上位机规划叠加）
         double control_yaw = angles::normalize_angle(control.yaw_state.p + limit_traj_cp0_.yaw);
         double control_pitch =
@@ -626,7 +813,7 @@ struct VeryAimer::Impl {
         cmd.target_pitch = angles::to_degrees(target_pitch);
         cmd.fly_time = last_fly_time_;
         cmd.appear = true;
-        cmd.aim_point = aim_traj.state_at(time_in_traj);
+        cmd.aim_point = aim_traj.state_at(eval_time);
         cmd.aim_point.frame_id = target.get_target_state().frame_id;
         cmd.select_id = last_select_;
         const bool is_big = target.target_number == ArmorClass::NO1;
@@ -662,7 +849,7 @@ struct VeryAimer::Impl {
             shooting_range_pitch = std::max(shooting_range_pitch, min_enable_pitch);
             return std::make_pair(std::abs(shooting_range_yaw), std::abs(shooting_range_pitch));
         };
-        auto enable_diff = cal_enbale_diff(time_in_traj);
+        auto enable_diff = cal_enbale_diff(eval_time);
         cmd.enable_yaw_diff = angles::to_degrees(enable_diff.first);
         cmd.enable_pitch_diff = angles::to_degrees(enable_diff.second);
         auto abs_angle_error = [](double from, double to) {
@@ -677,9 +864,9 @@ struct VeryAimer::Impl {
                ) < cmd.enable_pitch_diff;
         if (fsm != AutoAimFsm::AIM_WHOLE_CAR_CENTER) {
             auto delay_fire = [&](double delay) {
-                auto delay_control = get_control(time_in_traj + delay);
-                auto delay_target = target_traj.Trajectory::state_at(time_in_traj + delay);
-                auto delay_enable = cal_enbale_diff(time_in_traj + delay);
+                auto delay_control = get_control(eval_time + delay);
+                auto delay_target = target_traj.Trajectory::state_at(eval_time + delay);
+                auto delay_enable = cal_enbale_diff(eval_time + delay);
                 const double control_yaw =
                     angles::normalize_angle(delay_control.yaw_state.p + limit_traj_cp0_.yaw);
                 const double target_yaw =
@@ -696,7 +883,9 @@ struct VeryAimer::Impl {
                 bool has_can = false;
 
                 double t_check = 0 + params_.fire_delay_min; //发射延迟内不让打弹
-                while (t_check < (0 + params_.fire_delay_max) && t_check <= horizon / 2.0) {
+                const double max_check_t =
+                    use_vision_d ? std::max(0.0, horizon * dt - eval_time) : (horizon / 2.0);
+                while (t_check < (0 + params_.fire_delay_max) && t_check <= max_check_t) {
                     if (!delay_fire(+t_check)) {
                         cmd.no_shoot();
                     } else {
@@ -715,6 +904,10 @@ struct VeryAimer::Impl {
     void set_operator_offset(std::pair<double, double> offset) {
         operator_offset_ = offset;
     }
+    VeryAimDebugInfo get_debug_info() const noexcept {
+        return debug_;
+    }
+
     std::pair<double, double> get_yaw_pitch_offset() const noexcept {
         return std::make_pair(
             base_yaw_offset_rad_ + operator_offset_.first, //操作手在线调偏置
@@ -742,6 +935,23 @@ GimbalCmd VeryAimer::very_aim(
 ) {
     return _impl->very_aim(target, bullet_speed, fsm, shoot_in_gimbal_odom, gimbal_in_gimbal_odom);
 }
+VeryAimDebugInfo VeryAimer::get_debug_info() const {
+    return _impl->get_debug_info();
+}
+bool VeryAimer::uses_vision_d_mpc() const noexcept {
+    return _impl->uses_vision_d_mpc();
+}
+MpcMode VeryAimer::mpc_mode() const noexcept {
+    return _impl->mpc_mode();
+}
+const char* VeryAimer::mpc_mode_name(MpcMode mode) noexcept {
+    switch (mode) {
+    case MpcMode::VisionD: return "vision_d";
+    case MpcMode::Awakening: return "awakening";
+    }
+    return "unknown";
+}
+
 std::pair<double, double> VeryAimer::get_yaw_pitch_offset() {
     return _impl->get_yaw_pitch_offset();
 }

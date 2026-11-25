@@ -19,6 +19,8 @@ app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 3600
 STREAM_FPS = 60
 FRAME_INTERVAL = 1.0 / STREAM_FPS
 JSON_CACHE_TTL = 0.05
+TARGET_XYZ_SAMPLE_INTERVAL = 0.05
+TARGET_XYZ_HISTORY_MAX = 1000
 
 shared_memory_path = "/dev/shm/awakening_frame"
 shared_size = 2 * 1024 * 1024  # 2MB
@@ -40,6 +42,15 @@ reader_thread = None
 
 json_cache_lock = threading.Lock()
 json_cache = {}
+
+target_xyz_lock = threading.Lock()
+target_xyz_start = None
+target_xyz_history = {
+    "time": [],
+    "target_x": [],
+    "target_y": [],
+    "target_z": [],
+}
 
 
 def get_local_ip() -> str:
@@ -144,6 +155,66 @@ def read_json_cached(path: str):
         }
 
     return data
+
+
+def _read_target_xyz():
+    """Return (x, y, z) from the current armor target, or None when invalid."""
+    try:
+        log_data = read_json_cached(log_path)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+
+    target = log_data.get("armor_target")
+    if not isinstance(target, dict):
+        return None
+
+    if target.get("track_state") != "TRACKING":
+        return None
+
+    state = target.get("target_state")
+    if not isinstance(state, dict):
+        return None
+
+    try:
+        x = float(state["cx"])
+        y = float(state["cy"])
+        z = float(state["cz"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if not all(math.isfinite(value) for value in (x, y, z)):
+        return None
+    return x, y, z
+
+
+def target_xyz_reader_loop():
+    """Sample armor target XYZ at a fixed rate for the web curve panel."""
+    global target_xyz_start
+
+    while not stop_event.is_set():
+        now = time.monotonic()
+        if target_xyz_start is None:
+            target_xyz_start = now
+        t = now - target_xyz_start
+        xyz = _read_target_xyz()
+
+        with target_xyz_lock:
+            target_xyz_history["time"].append(round(t, 3))
+            if xyz is None:
+                target_xyz_history["target_x"].append(None)
+                target_xyz_history["target_y"].append(None)
+                target_xyz_history["target_z"].append(None)
+            else:
+                target_xyz_history["target_x"].append(round(xyz[0], 4))
+                target_xyz_history["target_y"].append(round(xyz[1], 4))
+                target_xyz_history["target_z"].append(round(xyz[2], 4))
+
+            overflow = len(target_xyz_history["time"]) - TARGET_XYZ_HISTORY_MAX
+            if overflow > 0:
+                for values in target_xyz_history.values():
+                    del values[:overflow]
+
+        stop_event.wait(TARGET_XYZ_SAMPLE_INTERVAL)
 
 
 def no_store_json(data, status=200):
@@ -328,6 +399,22 @@ def get_data():
         return no_store_json({"error": str(e)}, 500)
 
 
+@app.route("/target_xyz")
+def get_target_xyz():
+    try:
+        max_points = clamp_int(
+            request.args.get("max_points"), 200, 10, TARGET_XYZ_HISTORY_MAX
+        )
+        with target_xyz_lock:
+            data = {
+                key: list(values[-max_points:])
+                for key, values in target_xyz_history.items()
+            }
+        return no_store_json(data)
+    except Exception as e:
+        return no_store_json({"error": str(e)}, 500)
+
+
 @app.route("/log")
 def get_log():
     try:
@@ -347,6 +434,9 @@ if __name__ == "__main__":
 
     reader_thread = threading.Thread(target=frame_reader_loop, daemon=True)
     reader_thread.start()
+
+    target_xyz_thread = threading.Thread(target=target_xyz_reader_loop, daemon=True)
+    target_xyz_thread.start()
 
     url = f"http://{get_local_ip()}:{port}"
     print(f"✅ Web 调试器已启动: {url}")

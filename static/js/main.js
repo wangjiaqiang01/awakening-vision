@@ -50,6 +50,7 @@ document.addEventListener("DOMContentLoaded", () => {
   updateVideoPanelHeightLimit();
   initCharts();
   startDataLoop();
+  startTargetXyzLoop();
   fetchAndDisplayJsonWithTree("json-log", "/log");
   setInterval(() => fetchAndDisplayJsonWithTree("json-log", "/log"), LOG_POLL_INTERVAL_MS);
 });

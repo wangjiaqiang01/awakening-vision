@@ -27,6 +27,7 @@ struct TimingCsvSample {
     double gimbal_yaw_cmd_deg = std::numeric_limits<double>::quiet_NaN();
     double gimbal_pitch_img_deg = std::numeric_limits<double>::quiet_NaN();
     double gimbal_pitch_cmd_deg = std::numeric_limits<double>::quiet_NaN();
+    double gimbal_yaw_deg = std::numeric_limits<double>::quiet_NaN();
     double telemetry_yaw_deg = std::numeric_limits<double>::quiet_NaN();
     double telemetry_pitch_deg = std::numeric_limits<double>::quiet_NaN();
 
@@ -34,6 +35,8 @@ struct TimingCsvSample {
     double cmd_pitch_deg = 0.0;
     double target_yaw_deg = 0.0;
     double target_pitch_deg = 0.0;
+    double target_bearing_deg = std::numeric_limits<double>::quiet_NaN();
+    double shoot_bearing_deg = std::numeric_limits<double>::quiet_NaN();
 
     double err_cmd_target_yaw_deg = 0.0;
     double err_cmd_gimbal_yaw_deg = 0.0;
@@ -69,6 +72,18 @@ struct TimingCsvSample {
     int mode = -1;
     int tf_img_valid = 0;
     int telemetry_valid = 0;
+
+    int this_id_same = -1;
+    int fsm_same = -1;
+    int bullet_speed_same = -1;
+    int shoot_pose_same = -1;
+    int gimbal_pose_same = -1;
+    double time_in_traj_s = -1.0;
+
+    // 末尾追加，避免改变旧列顺序。
+    int aim_id = -1;
+    std::string this_id_change_reason = "none";
+    std::string aimer_type = "unknown";
 };
 
 class TimingCsvLogger {
@@ -112,12 +127,15 @@ public:
              << s.gimbal_yaw_cmd_deg << ','
              << s.gimbal_pitch_img_deg << ','
              << s.gimbal_pitch_cmd_deg << ','
+             << s.gimbal_yaw_deg << ','
              << s.telemetry_yaw_deg << ','
              << s.telemetry_pitch_deg << ','
              << s.cmd_yaw_deg << ','
              << s.cmd_pitch_deg << ','
              << s.target_yaw_deg << ','
              << s.target_pitch_deg << ','
+             << s.target_bearing_deg << ','
+             << s.shoot_bearing_deg << ','
              << s.err_cmd_target_yaw_deg << ','
              << s.err_cmd_gimbal_yaw_deg << ','
              << s.err_target_gimbal_yaw_deg << ','
@@ -147,7 +165,16 @@ public:
              << s.serial_send_to_image_us << ','
              << s.mode << ','
              << s.tf_img_valid << ','
-             << s.telemetry_valid << '\n';
+             << s.telemetry_valid << ','
+             << s.this_id_same << ','
+             << s.fsm_same << ','
+             << s.bullet_speed_same << ','
+             << s.shoot_pose_same << ','
+             << s.gimbal_pose_same << ','
+             << s.time_in_traj_s << ','
+             << s.aim_id << ','
+             << s.this_id_change_reason << ','
+             << s.aimer_type << '\n';
         if (++rows_ % 20 == 0) out_.flush();
     }
 
@@ -160,14 +187,17 @@ private:
         out_ << "wall_time_us,t_img_ns,t_cmd_ns,target_state_ts_ns,frame_ts_ns,"
              << "dt_img_cmd_ms,dt_state_cmd_ms,frame_dt_cmd_ms,target_frame_age_ms,telemetry_age_ms,tf_age_ms,"
              << "gimbal_yaw_img_deg,gimbal_yaw_cmd_deg,gimbal_pitch_img_deg,gimbal_pitch_cmd_deg,"
-             << "telemetry_yaw_deg,telemetry_pitch_deg,"
+             << "gimbal_yaw_deg,telemetry_yaw_deg,telemetry_pitch_deg,"
              << "cmd_yaw_deg,cmd_pitch_deg,target_yaw_deg,target_pitch_deg,"
+             << "target_bearing_deg,shoot_bearing_deg,"
              << "err_cmd_target_yaw_deg,err_cmd_gimbal_yaw_deg,err_target_gimbal_yaw_deg,"
              << "err_cmd_target_pitch_deg,err_cmd_gimbal_pitch_deg,err_target_gimbal_pitch_deg,"
              << "cmd_v_yaw,cmd_a_yaw,cmd_v_pitch,cmd_a_pitch,"
              << "select_id,target_number,this_id,match_count,frame_id,fsm,track_state,"
              << "target_valid,cmd_appear,cmd_valid,fire,distance_m,fly_time_s,exposure_us,camera_fps,"
-             << "bullet_speed,serial_send_to_image_us,mode,tf_img_valid,telemetry_valid\n";
+             << "bullet_speed,serial_send_to_image_us,mode,tf_img_valid,telemetry_valid,"
+             << "this_id_same,fsm_same,bullet_speed_same,shoot_pose_same,gimbal_pose_same,time_in_traj_s,"
+             << "aim_id,this_id_change_reason,aimer_type\n";
     }
 
     std::string path_;

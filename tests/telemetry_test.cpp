@@ -247,6 +247,32 @@ void driver_tests() {
     wait_for([&]{return r.statistics().connections==1;});close(unplug.master);unplug.master=-1;
     std::this_thread::sleep_for(100ms);start=std::chrono::steady_clock::now();r.stop();
     assert(std::chrono::steady_clock::now()-start<500ms);
+    // 直通 IO 线程回调：单次批量读取 3 帧只用最新帧回调一次，但累计帧数须准确且不重复推 Scheduler。
+    Pty direct; Scheduler direct_scheduler; auto direct_config=config(direct.slave);
+    SerialDriver direct_driver(direct_config,direct_scheduler);
+    std::atomic<int> cb_calls{0}, cb_frames{0};
+    std::atomic<float> cb_last_yaw{0.0f};
+    direct_driver.set_telemetry_callback(
+        [&](const TongjiTelemetry& s, std::chrono::system_clock::time_point, std::size_t n) {
+            cb_calls.fetch_add(1);
+            cb_frames.fetch_add(static_cast<int>(n));
+            cb_last_yaw.store(s.yaw);
+        }
+    );
+    direct_driver.start<Tag>("direct");
+    wait_for([&]{return direct_driver.statistics().connections==1;});
+    Bytes burst;
+    for (float y : {1.0f, 2.0f, 3.5f}) {
+        Bytes f; u16(f,28); u16(f,7); f32(f,y); f32(f,-1.0f); f32(f,0.0f); u32(f,1); u32(f,3);
+        u16(f,9); f32(f,21.0f);
+        burst.insert(burst.end(), f.begin(), f.end());
+    }
+    assert(::write(direct.master, burst.data(), burst.size()) == static_cast<ssize_t>(burst.size()));
+    wait_for([&]{return cb_frames.load()==3;});
+    assert(cb_calls.load()>=1 && cb_calls.load()<=3);
+    assert(cb_last_yaw.load()==3.5f);
+    assert(direct_scheduler.pushed.load()==0);
+    direct_driver.stop();
     // 未配置同济 ID 的旧协议串口仍须透传任意字节。
     Pty raw; Scheduler raw_scheduler; auto raw_config=config(raw.slave);
     raw_config["telemetry_gimbal_id"]=-1;raw_config["telemetry_shoot_id"]=-1;
