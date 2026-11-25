@@ -9,7 +9,7 @@ serial:
   char_size: 8
   read_buf_size: 4096
   # 同济协议：回传 ID 1 = 云台姿态（yaw/pitch/roll 度）、2 = 弹速；
-  # 发送为 18 字节控制帧（id1 云台角 + id2 开火标志），见 src/utils/drivers/command_protocol.hpp。
+  # 发送为 38 字节控制帧（id1 云台角 + id2 开火 + id3 角速度 + id4 角加速度），见 src/utils/drivers/command_protocol.hpp。
   # ID 已对齐 control-2026 的 master_process.c InitParam 注册（gimbal=1, shoot=2）。
   telemetry_gimbal_id: 1
   telemetry_shoot_id: 2

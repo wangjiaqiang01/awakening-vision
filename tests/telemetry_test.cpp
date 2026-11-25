@@ -78,24 +78,36 @@ void protocol_tests() {
     bad=p;bad[2]^=1;assert(TongjiTelemetry::decode(bad.data(),28,7,9,out));
     std::cout<<"PASS: payload/fields, all split boundaries, 10000 joined frames, timeout/reset, no-CRC limitation\n";
 }
-// 上位机 -> 下位机 线格式：必须与 control-2026 的 InitParam() 注册一致（18 字节）
+// 上位机 -> 下位机 线格式：38 字节 V/A 前馈帧
 void command_tests() {
-    const auto f = VisionCommand::encode(1.0f, -2.0f, true);
-    assert(f.size() == 18);
-    assert(f[0] == 0x10 && f[1] == 0x00);                          // total_len = 16
+    const auto f = VisionCommand::encode(
+        1.0f, -2.0f, true,
+        3.0f, -4.0f, 5.0f, -6.0f
+    );
+    assert(f.size() == 38);
+    assert(f[0] == 0x24 && f[1] == 0x00);                          // total_len = 36
     assert(f[2] == 0x01 && f[3] == 0x00);                          // id 1
-    assert(f[4] == 0x00 && f[5] == 0x00 && f[6] == 0x80 && f[7] == 0x3F);   // 1.0f
-    assert(f[8] == 0x00 && f[9] == 0x00 && f[10] == 0x00 && f[11] == 0xC0); // -2.0f
     assert(f[12] == 0x02 && f[13] == 0x00);                        // id 2
     assert(f[14] == 0x01 && f[15] == 0x00 && f[16] == 0x00 && f[17] == 0x00); // fire_flag = 1
+    assert(f[18] == 0x03 && f[19] == 0x00);                        // id 3
+    assert(f[28] == 0x04 && f[29] == 0x00);                        // id 4
+    auto read_f32 = [](const Bytes& b, size_t off) {
+        float v = 0.0f;
+        std::memcpy(&v, b.data() + off, sizeof(float));
+        return v;
+    };
+    assert(read_f32(f, 4) == 1.0f && read_f32(f, 8) == -2.0f);
+    assert(read_f32(f, 20) == 3.0f && read_f32(f, 24) == -4.0f);
+    assert(read_f32(f, 30) == 5.0f && read_f32(f, 34) == -6.0f);
+
     const auto g = VisionCommand::encode(0.0f, 0.0f, false);
-    assert(g.size() == 18);
+    assert(g.size() == 38);
     assert(g[14] == 0x00 && g[17] == 0x00);                        // fire_flag = 0
     assert(VisionCommand::encode_hold(1.0f, -2.0f) == VisionCommand::encode(1.0f, -2.0f, false));
     const auto zero_hold = VisionCommand::encode_hold(0.0f, 0.0f);
     assert(zero_hold != g && zero_hold[14] == 0x00 && zero_hold[17] == 0x00);
     assert(VisionCommand::encode_idle() == g);                     // 无目标时的空帧
-    std::cout << "PASS: command frame layout (18B: len/id1/yaw/pitch/id2/fire)\n";
+    std::cout << "PASS: command frame layout (38B: len/id1/yaw/pitch/id2/fire/id3/v/a/id4/v/a)\n";
 }
 void command_guard_tests() {
     VisionCommandGuard::Params params;

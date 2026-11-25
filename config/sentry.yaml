@@ -3,7 +3,7 @@ enemy_color: blue
 bullet_speed: 21.0
 
 serial:
-  # 哨兵上下位机联动：接收同济状态回传（ID 1/2），发送 18 字节控制帧，见 src/utils/drivers/command_protocol.hpp。
+  # 哨兵上下位机联动：接收同济状态回传（ID 1/2），发送 38 字节控制帧（角度/开火/角速度/角加速度），见 src/utils/drivers/command_protocol.hpp。
   enable: true
   device_name: /dev/ttyACM0 
   baud_rate: 115200

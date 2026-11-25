@@ -1037,7 +1037,7 @@ int main(int argc, char** argv) {
 
         if (serial) {
             // 下位机（control-2026）只接受「长度 + ID」帧：
-            // 每帧 18 字节 = id1{float yaw, float pitch} + id2{int32 fire_flag}。
+            // 每帧 38 字节 = id1{yaw,pitch} + id2{fire} + id3{v_yaw,v_pitch} + id4{a_yaw,a_pitch}。
             // 角度是绝对角（度）：yaw 同向；视觉 pitch 抬头为正，固件 IMU Pitch 抬头为负，
             // 因此只在发送边界乘 pitch_sign（见 config/dong.yaml，哨兵实机验证为 -1）。
             //
@@ -1048,6 +1048,10 @@ int main(int argc, char** argv) {
             const bool raw_target = cmd.appear && cmd.is_valid();
             const float raw_yaw_deg = static_cast<float>(cmd.yaw);
             const float raw_pitch_deg = static_cast<float>(pitch_sign * cmd.pitch);
+            const float raw_v_yaw_deg_s = static_cast<float>(cmd.v_yaw);
+            const float raw_v_pitch_deg_s = static_cast<float>(pitch_sign * cmd.v_pitch);
+            const float raw_a_yaw_deg_s2 = static_cast<float>(cmd.a_yaw);
+            const float raw_a_pitch_deg_s2 = static_cast<float>(pitch_sign * cmd.a_pitch);
             const double target_distance_m = raw_target
                 ? (cmd.aim_point.pose.translation() - shoot_in_gimbal_odom.translation()).norm()
                 : 0.0;
@@ -1104,7 +1108,11 @@ int main(int argc, char** argv) {
                         ? VisionCommand::encode(
                               guarded_yaw_deg,
                               guarded_pitch_deg,
-                              guarded.fire
+                              guarded.fire,
+                              raw_v_yaw_deg_s,
+                              raw_v_pitch_deg_s,
+                              raw_a_yaw_deg_s2,
+                              raw_a_pitch_deg_s2
                           )
                         : hold,
                     hold

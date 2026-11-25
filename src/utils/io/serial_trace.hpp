@@ -47,7 +47,7 @@ public:
         const auto wall = wall_iso();
         float yaw = 0.0f, pitch = 0.0f;
         int32_t fire = 0;
-        if (bytes.size() == 18) {
+        if (bytes.size() == 38) {
             std::memcpy(&yaw, bytes.data() + 4, sizeof(float));
             std::memcpy(&pitch, bytes.data() + 8, sizeof(float));
             std::memcpy(&fire, bytes.data() + 14, sizeof(int32_t));
